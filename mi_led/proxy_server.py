@@ -11,6 +11,7 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 from .device import MiLedDevice
+from .discovery import SessionBeacon, preferred_lan_ip
 from .proxy_protocol import DEFAULT_PROXY_HOST, DEFAULT_PROXY_PORT, PROTOCOL_VERSION, dumps, loads
 
 
@@ -29,15 +30,29 @@ class BleProxyServer:
         port: int = DEFAULT_PROXY_PORT,
         token: Optional[str] = None,
         auto_connect_ble: bool = True,
+        advertise: bool = True,
     ):
         self.host = host
         self.port = port
         self.token = token
         self.auto_connect_ble = auto_connect_ble
+        self.advertise = advertise
         self._device = MiLedDevice(on_status=self._on_device_status)
         self._clients: set = set()
         self._lock = asyncio.Lock()
         self._stop: asyncio.Event | None = None
+        self._beacon: Optional[SessionBeacon] = (
+            SessionBeacon(self._discovery_info) if advertise else None
+        )
+
+    def _discovery_info(self) -> dict:
+        return {
+            "name": socket.gethostname() or "MI LED Bridge",
+            "ip": preferred_lan_ip() or "",
+            "port": self.port,
+            "bridge": True,
+            "auth_required": bool(self.token),
+        }
 
     def _on_device_status(self, message: str) -> None:
         print(f"[ble] {message}")
@@ -204,6 +219,8 @@ class BleProxyServer:
 
     async def run(self) -> None:
         self._stop = asyncio.Event()
+        if self._beacon is not None:
+            self._beacon.start()
         if self.auto_connect_ble:
             print("[proxy] Connecting to MI Matrix Display over BLE...")
             ok = await self._device.connect()
@@ -214,10 +231,14 @@ class BleProxyServer:
         for ip in self._lan_addresses():
             print(f"[proxy] LAN URL: ws://{ip}:{self.port}")
 
-        async with serve(self._client_handler, self.host, self.port) as ws_server:
-            await self._stop.wait()
-            ws_server.close()
-            await ws_server.wait_closed()
+        try:
+            async with serve(self._client_handler, self.host, self.port) as ws_server:
+                await self._stop.wait()
+                ws_server.close()
+                await ws_server.wait_closed()
+        finally:
+            if self._beacon is not None:
+                self._beacon.stop()
         try:
             await self._device.disconnect()
         except Exception:

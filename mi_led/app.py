@@ -20,6 +20,7 @@ import customtkinter as ctk
 
 from .color_preview import PreviewStyle
 from .device import DeviceController
+from .discovery import SessionBeacon, SessionInfo, preferred_lan_ip, scan_sessions
 from .export_io import (
     load_animation_gif,
     load_animation_zip,
@@ -45,7 +46,7 @@ from .settings import (
 from .widgets import MatrixCanvas, MatrixThumb, rgb_to_hex
 
 # App revision — bump when diagnosing stale-module startup crashes.
-APP_REVISION = 8
+APP_REVISION = 9
 
 
 NAV_ITEMS = (
@@ -150,6 +151,8 @@ class MiLedApp(ctk.CTk):
         self._bridge_thread: Optional[threading.Thread] = None
         self._bridge_loop: Optional[asyncio.AbstractEventLoop] = None
         self._bridge_running = False
+        self._session_beacon = SessionBeacon(self._discovery_info)
+        self._session_scan_win: Optional[ctk.CTkToplevel] = None
         self._closing = False
 
         self.device = DeviceController(
@@ -160,6 +163,7 @@ class MiLedApp(ctk.CTk):
         self._preview_style = self._make_preview_style()
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._session_beacon.start()
 
         if self.settings.start_minimized:
             self.after(50, self.iconify)
@@ -529,9 +533,15 @@ class MiLedApp(ctk.CTk):
         body.grid_rowconfigure(5, weight=1)
 
         ctk.CTkLabel(body, text="Bind host").grid(row=0, column=0, padx=12, pady=8, sticky="w")
-        ctk.CTkEntry(body, textvariable=self.bridge_host, width=180).grid(
-            row=0, column=1, padx=8, pady=8, sticky="w"
-        )
+        host_row = ctk.CTkFrame(body, fg_color="transparent")
+        host_row.grid(row=0, column=1, padx=8, pady=8, sticky="w")
+        ctk.CTkEntry(host_row, textvariable=self.bridge_host, width=180).pack(side="left")
+        ctk.CTkButton(
+            host_row,
+            text="Local IP",
+            width=90,
+            command=self._fill_bridge_local_ip,
+        ).pack(side="left", padx=(8, 0))
         ctk.CTkLabel(body, text="Port").grid(row=1, column=0, padx=12, pady=8, sticky="w")
         ctk.CTkEntry(body, textvariable=self.bridge_port, width=100).grid(
             row=1, column=1, padx=8, pady=8, sticky="w"
@@ -579,6 +589,12 @@ class MiLedApp(ctk.CTk):
         ctk.CTkLabel(row, text="Token").pack(side="left", padx=(10, 6))
         self.token_entry = ctk.CTkEntry(row, textvariable=self.proxy_token, width=120)
         self.token_entry.pack(side="left", padx=4)
+        ctk.CTkButton(
+            row,
+            text="Scan for sessions",
+            width=140,
+            command=self._scan_bridge_sessions,
+        ).pack(side="left", padx=(12, 0))
         self._update_proxy_fields()
 
         self._bridge_log = ctk.CTkTextbox(body, height=180)
@@ -1942,6 +1958,9 @@ class MiLedApp(ctk.CTk):
 
     def _lan_addresses(self) -> list[str]:
         addrs: list[str] = []
+        preferred = self._preferred_lan_ip()
+        if preferred:
+            addrs.append(preferred)
         try:
             hostname = socket.gethostname()
             for info in socket.getaddrinfo(hostname, None, family=socket.AF_INET):
@@ -1951,6 +1970,178 @@ class MiLedApp(ctk.CTk):
         except Exception:
             pass
         return addrs
+
+    def _preferred_lan_ip(self) -> Optional[str]:
+        """Best-effort primary LAN IPv4 (does not send traffic)."""
+        return preferred_lan_ip()
+
+    def _discovery_info(self) -> dict:
+        port = DEFAULT_PROXY_PORT
+        try:
+            port = int(self.bridge_port.get().strip() or DEFAULT_PROXY_PORT)
+        except ValueError:
+            pass
+        return {
+            "name": socket.gethostname() or "MI LED GUI",
+            "ip": preferred_lan_ip() or "",
+            "port": port,
+            "bridge": bool(self._bridge_running),
+            "auth_required": bool(self.bridge_token.get().strip()),
+        }
+
+    def _fill_bridge_local_ip(self) -> None:
+        ip = self._preferred_lan_ip()
+        if not ip:
+            addrs = self._lan_addresses()
+            ip = addrs[0] if addrs else None
+        if not ip:
+            messagebox.showwarning("BLE Bridge", "Could not detect a local LAN IP.")
+            return
+        self.bridge_host.set(ip)
+        self._bridge_append(f"Bind host set to local IP: {ip}")
+
+    def _scan_bridge_sessions(self) -> None:
+        self._bridge_append("Scanning LAN for MI LED sessions…")
+        self._set_status("Scanning LAN for sessions…")
+
+        def worker() -> None:
+            try:
+                sessions = scan_sessions(timeout=1.8)
+            except Exception as exc:
+                self.after(0, lambda: self._session_scan_failed(str(exc)))
+                return
+            self.after(0, lambda: self._show_session_scan_results(sessions))
+
+        threading.Thread(target=worker, name="mi-led-session-scan", daemon=True).start()
+
+    def _session_scan_failed(self, error: str) -> None:
+        self._bridge_append(f"Session scan failed: {error}")
+        self._set_status(f"Session scan failed: {error}")
+        messagebox.showerror("Scan for sessions", f"Could not scan the LAN:\n{error}")
+
+    def _show_session_scan_results(self, sessions: list[SessionInfo]) -> None:
+        own_ips = set(self._lan_addresses())
+        preferred = self._preferred_lan_ip()
+        if preferred:
+            own_ips.add(preferred)
+
+        if self._session_scan_win is not None:
+            try:
+                self._session_scan_win.destroy()
+            except Exception:
+                pass
+            self._session_scan_win = None
+
+        win = ctk.CTkToplevel(self)
+        self._session_scan_win = win
+        win.title("Available sessions")
+        win.geometry("560x420")
+        win.transient(self)
+        win.grab_set()
+
+        ctk.CTkLabel(
+            win,
+            text="MI LED sessions on your local network",
+            font=ctk.CTkFont(size=16, weight="bold"),
+        ).pack(anchor="w", padx=16, pady=(16, 4))
+        ctk.CTkLabel(
+            win,
+            text="Select a host to fill Proxy host / Port. Bridge sessions can accept a GUI client.",
+            text_color=("gray35", "gray65"),
+            wraplength=520,
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        if not sessions:
+            ctk.CTkLabel(
+                win,
+                text="No sessions found.\nMake sure the other PC has the app open on the same LAN\n"
+                "(and allow UDP port 8766 through the firewall if needed).",
+                justify="left",
+            ).pack(anchor="w", padx=16, pady=20)
+            ctk.CTkButton(win, text="Close", width=100, command=win.destroy).pack(
+                pady=(8, 16)
+            )
+            self._bridge_append("Session scan: no hosts found")
+            self._set_status("No LAN sessions found")
+            return
+
+        scroll = ctk.CTkScrollableFrame(win, height=280)
+        scroll.pack(fill="both", expand=True, padx=12, pady=8)
+
+        bridges = 0
+        for session in sessions:
+            is_self = session.ip in own_ips
+            if session.bridge:
+                bridges += 1
+            row = ctk.CTkFrame(scroll)
+            row.pack(fill="x", padx=4, pady=4)
+            role = "Bridge" if session.bridge else "App only"
+            auth = " · token required" if session.auth_required else ""
+            self_tag = " · this PC" if is_self else ""
+            detail = f"{session.ip}:{session.port}  ·  {role}{auth}{self_tag}"
+            text_col = ctk.CTkFrame(row, fg_color="transparent")
+            text_col.pack(side="left", fill="x", expand=True, padx=10, pady=8)
+            ctk.CTkLabel(
+                text_col, text=session.name, font=ctk.CTkFont(weight="bold"), anchor="w"
+            ).pack(anchor="w")
+            ctk.CTkLabel(
+                text_col,
+                text=detail,
+                text_color=("gray35", "gray65"),
+                anchor="w",
+            ).pack(anchor="w")
+            ctk.CTkButton(
+                row,
+                text="Use",
+                width=70,
+                command=lambda s=session: self._use_discovered_session(s, win),
+            ).pack(side="right", padx=10, pady=8)
+
+        self._bridge_append(
+            f"Session scan: found {len(sessions)} host(s), {bridges} with bridge"
+        )
+        self._set_status(f"Found {len(sessions)} LAN session(s)")
+
+        ctk.CTkButton(win, text="Close", width=100, command=win.destroy).pack(pady=(4, 14))
+
+    def _use_discovered_session(self, session: SessionInfo, win: ctk.CTkToplevel) -> None:
+        self.connection_mode.set("BLE Proxy")
+        self.proxy_host.set(session.ip)
+        self.proxy_port.set(str(session.port))
+        self._update_proxy_fields()
+        self._persist_connection_settings()
+        note = ""
+        if not session.bridge:
+            note = " (host has the app open, but its bridge is not running yet)"
+        elif session.auth_required:
+            note = " — enter the shared token before connecting"
+        self._bridge_append(f"Selected session {session.name} at {session.ip}:{session.port}{note}")
+        self._set_status(f"Proxy set to {session.ip}:{session.port}")
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        self._session_scan_win = None
+
+    def _persist_connection_settings(self) -> None:
+        try:
+            self.settings.connection_mode = "proxy" if self._is_proxy_mode() else "local"
+            self.settings.proxy_host = self.proxy_host.get().strip() or "127.0.0.1"
+            self.settings.proxy_token = self.proxy_token.get()
+            try:
+                self.settings.proxy_port = int(self.proxy_port.get().strip() or DEFAULT_PROXY_PORT)
+            except ValueError:
+                pass
+            self.settings.bridge_bind_host = self.bridge_host.get().strip() or "0.0.0.0"
+            self.settings.bridge_token = self.bridge_token.get()
+            try:
+                self.settings.bridge_port = int(self.bridge_port.get().strip() or DEFAULT_PROXY_PORT)
+            except ValueError:
+                pass
+            save_settings(self.settings)
+        except Exception:
+            pass
 
     def _bridge_start(self) -> None:
         if self._bridge_running:
@@ -1973,7 +2164,7 @@ class MiLedApp(ctk.CTk):
             self._on_disconnect()
 
         self._bridge_server = BleProxyServer(
-            host=host, port=port, token=token, auto_connect_ble=True
+            host=host, port=port, token=token, auto_connect_ble=True, advertise=False
         )
         loop = asyncio.new_event_loop()
         self._bridge_loop = loop
@@ -2155,6 +2346,10 @@ class MiLedApp(ctk.CTk):
         if self._bridge_running:
             self._bridge_stop()
             time.sleep(0.2)
+        try:
+            self._session_beacon.stop()
+        except Exception:
+            pass
         self._power_off_for_logoff()
         self._closing = True
         try:
