@@ -193,7 +193,6 @@ async def main():
                 await asyncio.sleep(0.1)
         except KeyboardInterrupt:
             print("\nStopping...")
-            break
 
 if __name__ == "__main__":
     try:
