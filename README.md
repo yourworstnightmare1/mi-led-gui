@@ -1,59 +1,79 @@
 # Merkury Innovations Matrix LED Display SDK
 
-This project provides a set of Python scripts to interface with the Merkury Innovations Multicolor Matrix LED Display. This product is available at [Walmart](https://www.walmart.com/ip/Merkury-Innovations-Bluetooth-Matrix-LED-Pixel-Display/5150283693). The purpose of this project is to reverse engineer the communication protocol to allow developers to create custom applications for this device. The model number of the display is MI-LNL62-999W.
+Python toolkit and desktop GUI for the Merkury Innovations Multicolor Matrix LED Display (MI-LNL62-999W), based on reverse engineering of its BLE protocol. The display is sold at [Walmart](https://www.walmart.com/ip/Merkury-Innovations-Bluetooth-Matrix-LED-Pixel-Display/5150283693).
 
-## Repository Contents
+## Desktop GUI
 
-- `draw_picture.py`: Script to draw a static picture on the display.
-- `draw_pixels.py`: Script to send color data to individual pixels on the display.
-- `draw_file.py` : Script to load a static file and send to picture to the display
-- `index.html`: Web-based attempt to connect to the display (note: does not work due to service listing issues in browsers for this hardware).
+The `mi_led` package provides a CustomTkinter app with:
 
-## Getting Started
+- Auto-connect (name match, then service-UUID fallback used on macOS)
+- Power on / off
+- 16×16 pixel canvas with live BLE updates or manual **Send to Display**
+- Image upload (PNG/JPG/GIF) resized and color-boosted for the matrix
+- **BLE Proxy** so one machine owns Bluetooth and another controls the panel over the LAN
 
-You can try it in your browser:
-[Grafitti](https://htmlpreview.github.io/?https://github.com/offe/mi-led-display/blob/main/grafitti.html)
-[Show image](https://htmlpreview.github.io/?https://github.com/offe/mi-led-display/blob/main/show_image.html)
-
-### Prerequisites
-
-Ensure you have Python 3.7 or higher installed on your system. You can verify this by running:
-
-```bash
-python3 --version
-```
-
-### Installation
-
-Clone this repository locally and navigate into the project directory:
-
-```bash
-git clone https://github.com/yourusername/mi-led-display.git
-cd mi-led-display
-```
-
-Install the required Python libraries using pip:
+### Setup
 
 ```bash
 python3 -m venv venv
-python3 -m pip install bleak
-python3 -m pip install pil
+# Windows
+venv\Scripts\activate
+# macOS / Linux
+source venv/bin/activate
+
+pip install -r requirements.txt
 ```
 
-### Running the Scripts
-
-To run the scripts, use the following commands:
+### Run (local Bluetooth)
 
 ```bash
-python3 draw_picture.py
-python3 draw_pixels.py
-python3 draw_file.py /path/to/image.png
+python run_gui.py
 ```
+
+On macOS, grant Bluetooth permission to Terminal/Python when prompted. Keep the display powered and nearby.
+
+### BLE Proxy (Windows ↔ macOS)
+
+USB on the panel is power-only; control is always BLE. If the display is near a Mac but you want to drive it from Windows (or the reverse), run a proxy on the BLE host:
+
+```text
+Windows GUI  --WebSocket-->  Mac proxy  --BLE-->  MI Matrix Display
+```
+
+**On the BLE host** (machine next to the display):
+
+```bash
+python run_proxy.py
+# optional: python run_proxy.py --port 8765 --token secret
+```
+
+The proxy prints LAN URLs such as `ws://192.168.1.20:8765`. Allow that port through the host firewall if needed.
+
+**On the control PC** (GUI):
+
+1. Run `python run_gui.py`
+2. Set **Transport** to **BLE Proxy**
+3. Enter the BLE host’s LAN IP and port (default `8765`)
+4. Enter the same token if you started the proxy with `--token`
+5. Click **Connect**
+
+Either OS can be the BLE host or the GUI client.
+
+## Scripts
+
+- `draw_picture.py` — full-frame picture updates (includes two-pass discovery)
+- `draw_pixels.py` — graffiti-mode pixel streaming
+- `draw_file.py` — load an image file and push it to the display
+
+Browser demos (Web Bluetooth can be unreliable with this hardware):
+
+- [Graffiti](https://htmlpreview.github.io/?https://github.com/offe/mi-led-display/blob/main/grafitti.html)
+- [Show image](https://htmlpreview.github.io/?https://github.com/offe/mi-led-display/blob/main/show_image.html)
 
 ## Collecting Bluetooth Snoop Logs
 
-Instructions for collecting Bluetooth snoop logs are also provided to assist with further development and debugging. See `snoop_instructions.md` for details.
+See `snoop_instructions.md` for capturing Android Bluetooth HCI snoop logs.
 
 ## License
 
-This project is licensed under the MIT License
+MIT
