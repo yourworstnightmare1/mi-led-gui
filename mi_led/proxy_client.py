@@ -13,6 +13,7 @@ from .proxy_protocol import DEFAULT_PROXY_URL, dumps, loads
 
 
 StatusCallback = Callable[[str], None]
+ConnectionLostCallback = Callable[[], None]
 
 
 class ProxyDevice:
@@ -28,11 +29,13 @@ class ProxyDevice:
         token: Optional[str] = None,
         on_status: Optional[StatusCallback] = None,
         on_debug: Optional[StatusCallback] = None,
+        on_connection_lost: Optional[ConnectionLostCallback] = None,
     ):
         self.url = url
         self.token = token
         self._on_status = on_status or (lambda _msg: None)
         self._on_debug = on_debug or (lambda _msg: None)
+        self._on_connection_lost = on_connection_lost or (lambda: None)
         self._ws = None
         self._connected = False
         self._label = "Remote proxy"
@@ -40,6 +43,7 @@ class ProxyDevice:
         self._pending: dict[int, asyncio.Future] = {}
         self._recv_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
+        self._suppress_lost = False
 
     @property
     def is_connected(self) -> bool:
@@ -55,12 +59,27 @@ class ProxyDevice:
     def _debug(self, message: str) -> None:
         self._on_debug(message)
 
+    def _notify_connection_lost(self) -> None:
+        if self._suppress_lost:
+            return
+        try:
+            self._on_connection_lost()
+        except Exception:
+            pass
+
     async def _ensure_socket(self) -> None:
         if self._ws is not None:
             return
 
         self._status(f"Connecting to proxy {self.url}...")
-        self._ws = await ws_connect(self.url, open_timeout=10, max_size=2**20)
+        try:
+            self._ws = await ws_connect(self.url, open_timeout=10, max_size=2**20)
+        except Exception as exc:
+            self._ws = None
+            raise ConnectionError(
+                f"Could not reach BLE proxy at {self.url} ({exc}). "
+                "Start the bridge on that PC, or switch Mode to Local BLE."
+            ) from exc
         self._recv_task = asyncio.create_task(self._recv_loop())
 
         if self.token:
@@ -89,6 +108,7 @@ class ProxyDevice:
                 if msg_type == "event" and msg.get("event") == "disconnected":
                     self._connected = False
                     self._status("Remote BLE disconnected")
+                    self._notify_connection_lost()
                     continue
 
                 req_id = msg.get("id")
@@ -102,12 +122,15 @@ class ProxyDevice:
         except ConnectionClosed:
             self._status("Proxy connection closed")
         finally:
+            lost = self._connected and not self._suppress_lost
             self._connected = False
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(ConnectionError("Proxy connection closed"))
             self._pending.clear()
             self._ws = None
+            if lost:
+                self._notify_connection_lost()
 
     async def _request(self, cmd: str, **fields: Any) -> Any:
         self._debug(f"PROXY TX cmd={cmd} fields={ {k: v for k, v in fields.items() if k != 'pixels'} }")
@@ -144,33 +167,37 @@ class ProxyDevice:
         return self._connected
 
     async def disconnect(self) -> None:
+        self._suppress_lost = True
         try:
-            if self._ws is not None:
-                await asyncio.wait_for(self._request("disconnect"), timeout=5)
-        except Exception:
-            pass
-        self._connected = False
-
-        recv = self._recv_task
-        ws = self._ws
-        self._recv_task = None
-        self._ws = None
-
-        if recv is not None:
-            recv.cancel()
             try:
-                await recv
-            except asyncio.CancelledError:
-                pass
+                if self._ws is not None:
+                    await asyncio.wait_for(self._request("disconnect"), timeout=5)
             except Exception:
                 pass
+            self._connected = False
 
-        if ws is not None:
-            try:
-                await ws.close()
-            except Exception:
-                pass
-        self._status("Disconnected from proxy")
+            recv = self._recv_task
+            ws = self._ws
+            self._recv_task = None
+            self._ws = None
+
+            if recv is not None:
+                recv.cancel()
+                try:
+                    await recv
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            self._status("Disconnected from proxy")
+        finally:
+            self._suppress_lost = False
 
     async def power_on(self) -> None:
         await self._request("power_on")

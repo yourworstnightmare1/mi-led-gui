@@ -17,6 +17,7 @@ from .proxy_protocol import DEFAULT_PROXY_URL
 
 StatusCallback = Callable[[str], None]
 DebugCallback = Callable[[str], None]
+ConnectionLostCallback = Callable[[], None]
 Backend = Union["MiLedDevice", ProxyDevice]
 
 
@@ -34,6 +35,7 @@ class MiLedDevice:
         self,
         on_status: Optional[StatusCallback] = None,
         on_debug: Optional[DebugCallback] = None,
+        on_connection_lost: Optional[ConnectionLostCallback] = None,
     ):
         self._client: Optional[BleakClient] = None
         self._address: Optional[str] = None
@@ -42,8 +44,10 @@ class MiLedDevice:
         self._framebuffer: list[tuple[int, int, int]] = [(0, 0, 0)] * proto.PIXEL_COUNT
         self._on_status = on_status or (lambda _msg: None)
         self._on_debug = on_debug or (lambda _msg: None)
+        self._on_connection_lost = on_connection_lost or (lambda: None)
         self._lock = asyncio.Lock()
         self._quiet_tx = False
+        self._suppress_lost = False
 
     @property
     def is_connected(self) -> bool:
@@ -61,6 +65,24 @@ class MiLedDevice:
 
     def _debug(self, message: str) -> None:
         self._on_debug(message)
+
+    def _notify_connection_lost(self) -> None:
+        if self._suppress_lost:
+            return
+        try:
+            self._on_connection_lost()
+        except Exception:
+            pass
+
+    def _on_ble_disconnected(self, _client: BleakClient) -> None:
+        """Bleak callback — may run outside our asyncio tasks."""
+        if self._suppress_lost:
+            return
+        self._client = None
+        self._graffiti_ready = False
+        self._status("BLE connection lost")
+        self._debug("GATT disconnected unexpectedly")
+        self._notify_connection_lost()
 
     async def find_device(self, scan_timeout: float = 10.0):
         self._status("Scanning for BLE devices...")
@@ -108,7 +130,7 @@ class MiLedDevice:
             return False
 
         self._status(f"Connecting to {target.name or 'device'} ({target.address})...")
-        client = BleakClient(target)
+        client = BleakClient(target, disconnected_callback=self._on_ble_disconnected)
         await client.connect()
         if not client.is_connected:
             self._status("Failed to connect")
@@ -124,18 +146,22 @@ class MiLedDevice:
         return True
 
     async def disconnect(self) -> None:
+        self._suppress_lost = True
         client = self._client
         self._client = None
         self._graffiti_ready = False
         self._framebuffer = [(0, 0, 0)] * proto.PIXEL_COUNT
-        if client is not None:
-            try:
-                if client.is_connected:
-                    await client.disconnect()
-            except Exception:
-                pass
-        self._status("Disconnected")
-        self._debug("GATT disconnected")
+        try:
+            if client is not None:
+                try:
+                    if client.is_connected:
+                        await client.disconnect()
+                except Exception:
+                    pass
+            self._status("Disconnected")
+            self._debug("GATT disconnected")
+        finally:
+            self._suppress_lost = False
 
     async def _write(
         self, data: bytes | bytearray, delay: float = 0.02, *, label: str = ""
@@ -317,6 +343,7 @@ class DeviceController:
         self,
         on_status: Optional[StatusCallback] = None,
         on_debug: Optional[DebugCallback] = None,
+        on_connection_lost: Optional[ConnectionLostCallback] = None,
         *,
         mode: str = "local",
         proxy_url: str = DEFAULT_PROXY_URL,
@@ -324,6 +351,7 @@ class DeviceController:
     ):
         self._on_status = on_status or (lambda _msg: None)
         self._on_debug = on_debug or (lambda _msg: None)
+        self._on_connection_lost = on_connection_lost or (lambda: None)
         self._mode = mode
         self._proxy_url = proxy_url
         self._proxy_token = proxy_token
@@ -339,8 +367,13 @@ class DeviceController:
                 token=self._proxy_token,
                 on_status=self._forward_status,
                 on_debug=self._forward_debug,
+                on_connection_lost=self._forward_connection_lost,
             )
-        return MiLedDevice(on_status=self._forward_status, on_debug=self._forward_debug)
+        return MiLedDevice(
+            on_status=self._forward_status,
+            on_debug=self._forward_debug,
+            on_connection_lost=self._forward_connection_lost,
+        )
 
     def configure(
         self,
@@ -369,6 +402,9 @@ class DeviceController:
 
     def _forward_debug(self, message: str) -> None:
         self._on_debug(message)
+
+    def _forward_connection_lost(self) -> None:
+        self._on_connection_lost()
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 # 3x5 glyphs — each row is a 3-bit mask (MSB = left).
 _GLYPHS: dict[str, tuple[int, int, int, int, int]] = {
     " ": (0b000, 0b000, 0b000, 0b000, 0b000),
@@ -24,12 +26,14 @@ _GLYPHS: dict[str, tuple[int, int, int, int, int]] = {
     "G": (0b011, 0b100, 0b101, 0b101, 0b011),
     "H": (0b101, 0b101, 0b111, 0b101, 0b101),
     "I": (0b111, 0b010, 0b010, 0b010, 0b111),
+    "J": (0b001, 0b001, 0b001, 0b101, 0b010),
     "K": (0b101, 0b101, 0b110, 0b101, 0b101),
     "L": (0b100, 0b100, 0b100, 0b100, 0b111),
     "M": (0b101, 0b111, 0b111, 0b101, 0b101),
     "N": (0b101, 0b111, 0b111, 0b111, 0b101),
     "O": (0b010, 0b101, 0b101, 0b101, 0b010),
     "P": (0b110, 0b101, 0b110, 0b100, 0b100),
+    "Q": (0b010, 0b101, 0b101, 0b111, 0b001),
     "R": (0b110, 0b101, 0b110, 0b101, 0b101),
     "S": (0b011, 0b100, 0b010, 0b001, 0b110),
     "T": (0b111, 0b010, 0b010, 0b010, 0b010),
@@ -38,54 +42,92 @@ _GLYPHS: dict[str, tuple[int, int, int, int, int]] = {
     "W": (0b101, 0b101, 0b111, 0b111, 0b101),
     "X": (0b101, 0b101, 0b010, 0b101, 0b101),
     "Y": (0b101, 0b101, 0b010, 0b010, 0b010),
+    "Z": (0b111, 0b001, 0b010, 0b100, 0b111),
     "%": (0b101, 0b001, 0b010, 0b100, 0b101),
     ":": (0b000, 0b010, 0b000, 0b010, 0b000),
     "-": (0b000, 0b000, 0b111, 0b000, 0b000),
     ".": (0b000, 0b000, 0b000, 0b000, 0b010),
+    "!": (0b010, 0b010, 0b010, 0b000, 0b010),
+    "?": (0b111, 0b001, 0b010, 0b000, 0b010),
+    "'": (0b010, 0b010, 0b000, 0b000, 0b000),
+    "+": (0b000, 0b010, 0b111, 0b010, 0b000),
 }
 
 GLYPH_W = 3
 GLYPH_H = 5
 
 
+def normalize_scale(scale: float | int) -> float:
+    try:
+        value = float(scale)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(0.4, min(3.0, value))
+
+
+def glyph_height(scale: float | int = 1) -> int:
+    return max(1, int(math.ceil(GLYPH_H * normalize_scale(scale))))
+
+
+def glyph_advance(scale: float | int = 1, spacing: int = 1) -> float:
+    return GLYPH_W * normalize_scale(scale) + spacing
+
+
 def draw_text(
     frame: list[tuple[int, int, int]],
     text: str,
-    x: int,
-    y: int,
+    x: float,
+    y: float,
     color: tuple[int, int, int],
     *,
     size: int = 16,
     spacing: int = 1,
+    scale: float | int = 1,
 ) -> None:
-    """Blit 3x5 text into a row-major `size`x`size` frame."""
-    cx = x
+    """
+    Blit 3x5 text into a row-major ``size``x``size`` frame.
+
+    ``scale`` may be fractional (e.g. 0.5, 0.7) or integer (1, 2, 3).
+    """
+    s = normalize_scale(scale)
+    cx = float(x)
     for ch in text.upper():
         glyph = _GLYPHS.get(ch, _GLYPHS[" "])
-        for gy, row in enumerate(glyph):
-            for gx in range(GLYPH_W):
-                if row & (0b100 >> gx):
-                    px, py = cx + gx, y + gy
-                    if 0 <= px < size and 0 <= py < size:
-                        frame[py * size + px] = color
-        cx += GLYPH_W + spacing
+        out_w = max(1, int(math.ceil(GLYPH_W * s)))
+        out_h = max(1, int(math.ceil(GLYPH_H * s)))
+        for oy in range(out_h):
+            for ox in range(out_w):
+                # Stretch the 3x5 glyph across the scaled footprint.
+                gx = min(GLYPH_W - 1, (ox * GLYPH_W) // out_w)
+                gy = min(GLYPH_H - 1, (oy * GLYPH_H) // out_h)
+                row = glyph[gy]
+                if not (row & (0b100 >> gx)):
+                    continue
+                px = int(round(cx + ox))
+                py = int(round(y + oy))
+                if 0 <= px < size and 0 <= py < size:
+                    frame[py * size + px] = color
+        cx += GLYPH_W * s + spacing
 
 
-def text_width(text: str, spacing: int = 1) -> int:
+def text_width(text: str, spacing: int = 1, scale: float | int = 1) -> int:
     if not text:
         return 0
-    return len(text) * GLYPH_W + (len(text) - 1) * spacing
+    s = normalize_scale(scale)
+    n = len(text)
+    return int(math.ceil(n * GLYPH_W * s + max(0, n - 1) * spacing))
 
 
 def draw_centered_text(
     frame: list[tuple[int, int, int]],
     text: str,
-    y: int,
+    y: float,
     color: tuple[int, int, int],
     *,
     size: int = 16,
     spacing: int = 1,
+    scale: float | int = 1,
 ) -> None:
-    w = text_width(text, spacing)
+    w = text_width(text, spacing, scale=scale)
     x = max(0, (size - w) // 2)
-    draw_text(frame, text, x, y, color, size=size, spacing=spacing)
+    draw_text(frame, text, x, y, color, size=size, spacing=spacing, scale=scale)

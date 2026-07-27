@@ -18,12 +18,16 @@ from typing import Optional
 
 import customtkinter as ctk
 
+from .audio_capture import AudioCapture, audio_available
 from .color_preview import PreviewStyle
 from .device import DeviceController
 from .discovery import SessionBeacon, SessionInfo, preferred_lan_ip, scan_sessions
 from .export_io import (
     load_animation_gif,
+    load_animation_python,
     load_animation_zip,
+    load_drawing_python,
+    load_frame_png,
     save_animation_gif,
     save_animation_python,
     save_animation_zip,
@@ -31,6 +35,7 @@ from .export_io import (
     save_frame_png,
 )
 from .image_convert import blank_frame, load_image_as_matrix
+from .music_viz import MUSIC_MODE_LABELS, render_mode
 from .presets import ANIMATION_BY_LABEL, ANIMATION_PRESETS, DRAWING_BY_LABEL, DRAWING_PRESETS
 from .protocol import MATRIX_SIZE
 from .proxy_protocol import DEFAULT_PROXY_PORT
@@ -43,16 +48,19 @@ from .settings import (
     save_workspace,
     settings_dir,
 )
+from .text_render import apply_brightness, max_line_width, render_text_frame
 from .widgets import MatrixCanvas, MatrixThumb, rgb_to_hex
 
 # App revision — bump when diagnosing stale-module startup crashes.
-APP_REVISION = 9
+APP_REVISION = 20
 
 
 NAV_ITEMS = (
     ("home", "Home"),
     ("draw", "Draw"),
     ("animate", "Animate"),
+    ("text", "Text"),
+    ("music", "Music"),
     ("bridge", "BLE Bridge"),
     ("debug", "BLE Debugging"),
     ("settings", "Settings"),
@@ -119,6 +127,8 @@ class MiLedApp(ctk.CTk):
         self._preview: Optional[MatrixCanvas] = None
         self._draw_canvas: Optional[MatrixCanvas] = None
         self._animate_canvas: Optional[MatrixCanvas] = None
+        self._music_canvas: Optional[MatrixCanvas] = None
+        self._text_canvas: Optional[MatrixCanvas] = None
         self._debug_textbox: Optional[ctk.CTkTextbox] = None
         self._debug_status_var = tk.StringVar(value="")
         self._bridge_log: Optional[ctk.CTkTextbox] = None
@@ -146,6 +156,45 @@ class MiLedApp(ctk.CTk):
         self._last_sent_frame: Optional[list[tuple[int, int, int]]] = None
         self._active_preset_label: Optional[str] = None
 
+        # Music reactive state
+        self._audio = AudioCapture()
+        self._music_source = tk.StringVar(value="Microphone")
+        self._music_mode = tk.StringVar(value=MUSIC_MODE_LABELS[0])
+        self._music_sensitivity = tk.DoubleVar(value=1.0)
+        self._music_level_var = tk.StringVar(value="Level: —")
+        self._music_status_var = tk.StringVar(
+            value=(
+                "Audio ready"
+                if audio_available()
+                else "Install sounddevice + numpy for music modes"
+            )
+        )
+        self._music_listening = False
+        self._music_on_display = False
+        self._music_preview_job: Optional[str] = None
+        self._music_listen_btn: Optional[ctk.CTkButton] = None
+        self._music_display_btn: Optional[ctk.CTkButton] = None
+
+        # Shared playback controls (Draw / Animate / Text / Music)
+        self._fx_speed = tk.DoubleVar(value=1.0)
+        self._fx_brightness = tk.DoubleVar(value=1.0)
+
+        # Text tab
+        self._text_line1 = tk.StringVar(value="HELLO")
+        self._text_line2 = tk.StringVar(value="")
+        self._text_color = (255, 220, 40)
+        self._text_scale_label = tk.StringVar(value="1")
+        self._text_bg_mode = tk.StringVar(value="Solid")
+        self._text_bg_color = (0, 0, 0)
+        self._text_bg_frames: list[list[tuple[int, int, int]]] = [blank_frame()]
+        self._text_scroll = tk.BooleanVar(value=True)
+        self._text_playing = False
+        self._text_job: Optional[str] = None
+        self._text_tick = 0
+        self._text_color_btn: Optional[ctk.CTkButton] = None
+        self._text_bg_color_btn: Optional[ctk.CTkButton] = None
+        self._text_play_btn: Optional[ctk.CTkButton] = None
+
         # Embedded BLE bridge
         self._bridge_server: Optional[BleProxyServer] = None
         self._bridge_thread: Optional[threading.Thread] = None
@@ -154,10 +203,14 @@ class MiLedApp(ctk.CTk):
         self._session_beacon = SessionBeacon(self._discovery_info)
         self._session_scan_win: Optional[ctk.CTkToplevel] = None
         self._closing = False
+        self._want_connection = False
+        self._reconnect_job: Optional[str] = None
+        self._connection_watch_job: Optional[str] = None
 
         self.device = DeviceController(
             on_status=self._queue_status,
             on_debug=self._queue_debug,
+            on_connection_lost=self._queue_connection_lost,
         )
 
         self._preview_style = self._make_preview_style()
@@ -165,11 +218,110 @@ class MiLedApp(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._session_beacon.start()
 
-        if self.settings.start_minimized:
-            self.after(50, self.iconify)
+        # Defer minimize until after the Connection Notice — otherwise the modal
+        # dialog is hidden and grab_set freezes the main window on "Starting…".
+        self._defer_minimize = bool(self.settings.start_minimized)
 
         atexit.register(self._power_off_for_logoff)
-        self.after(200, self._auto_connect)
+        self.after(200, self._startup_sequence)
+        self.after(2500, self._connection_watch)
+
+    def _startup_sequence(self) -> None:
+        self._maybe_show_connection_notice(on_done=self._after_connection_notice)
+
+    def _after_connection_notice(self) -> None:
+        # Never minimize immediately after the user just dismissed a dialog —
+        # that makes the UI look like it disappeared. Only honor start_minimized
+        # when the notice was skipped (already acknowledged).
+        self._defer_minimize = False
+        try:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+        self._auto_connect()
+
+    def _maybe_show_connection_notice(self, *, on_done=None) -> None:
+        if getattr(self.settings, "hide_connection_notice", False):
+            if self._defer_minimize:
+                self._defer_minimize = False
+                try:
+                    self.after(50, self.iconify)
+                except Exception:
+                    pass
+            if on_done is not None:
+                on_done()
+            return
+
+        self._set_status("Please read the Connection Notice…")
+        try:
+            self.deiconify()
+            self.lift()
+        except Exception:
+            pass
+
+        win = ctk.CTkToplevel(self)
+        win.title("Connection Notice")
+        win.geometry("560x320")
+        win.transient(self)
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        win.lift()
+        win.focus_force()
+        win.grab_set()
+
+        ctk.CTkLabel(
+            win,
+            text="Connection Notice",
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).pack(anchor="w", padx=18, pady=(16, 8))
+        ctk.CTkLabel(
+            win,
+            text=(
+                "If you have the official Matrix Panel Plus or MIMatrixPanel apps "
+                "installed and opened, please close them as they are known to block "
+                "other devices from connecting to the LED display. We recommend also "
+                "just uninstalling them as they are not very good and extremely buggy "
+                "and limited compared to what this tool and its CLI equivalent can do."
+            ),
+            wraplength=520,
+            justify="left",
+            anchor="w",
+        ).pack(anchor="w", padx=18, pady=(0, 12))
+
+        skip_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(win, text="Do not show again", variable=skip_var).pack(
+            anchor="w", padx=18, pady=(0, 16)
+        )
+
+        def close() -> None:
+            if skip_var.get():
+                self.settings.hide_connection_notice = True
+                try:
+                    save_settings(self.settings)
+                except Exception:
+                    pass
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            try:
+                win.attributes("-topmost", False)
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            if on_done is not None:
+                on_done()
+
+        ctk.CTkButton(win, text="OK", width=100, command=close).pack(pady=(4, 18))
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.after(50, lambda: (win.lift(), win.focus_force()))
 
     def _make_preview_style(self) -> PreviewStyle:
         s = self.settings
@@ -184,7 +336,13 @@ class MiLedApp(ctk.CTk):
 
     def _apply_preview_style(self) -> None:
         self._preview_style = self._make_preview_style()
-        for canvas in (self._preview, self._draw_canvas, self._animate_canvas):
+        for canvas in (
+            self._preview,
+            self._draw_canvas,
+            self._animate_canvas,
+            self._music_canvas,
+            self._text_canvas,
+        ):
             if canvas is not None:
                 canvas.set_preview_style(self._preview_style)
 
@@ -197,7 +355,7 @@ class MiLedApp(ctk.CTk):
         sidebar = ctk.CTkFrame(self, width=180, corner_radius=0)
         sidebar.grid(row=0, column=0, sticky="nsw")
         sidebar.grid_propagate(False)
-        sidebar.grid_rowconfigure(len(NAV_ITEMS) + 2, weight=1)
+        sidebar.grid_rowconfigure(len(NAV_ITEMS) + 1, weight=1)
 
         ctk.CTkLabel(
             sidebar, text="MI LED", font=ctk.CTkFont(size=20, weight="bold")
@@ -220,15 +378,6 @@ class MiLedApp(ctk.CTk):
             btn.grid(row=i + 2, column=0, sticky="ew", padx=10, pady=3)
             self._nav_buttons[key] = btn
 
-        conn = ctk.CTkFrame(sidebar, fg_color="transparent")
-        conn.grid(row=len(NAV_ITEMS) + 2, column=0, sticky="sew", padx=10, pady=12)
-        self.connect_btn = ctk.CTkButton(conn, text="Connect", height=32, command=self._on_connect)
-        self.connect_btn.pack(fill="x", pady=(0, 6))
-        self.disconnect_btn = ctk.CTkButton(
-            conn, text="Disconnect", height=32, command=self._on_disconnect, state="disabled"
-        )
-        self.disconnect_btn.pack(fill="x")
-
         main = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
         main.grid(row=0, column=1, sticky="nsew")
         main.grid_columnconfigure(0, weight=1)
@@ -250,6 +399,8 @@ class MiLedApp(ctk.CTk):
         self._pages["home"] = self._build_home(self.content)
         self._pages["draw"] = self._build_draw(self.content)
         self._pages["animate"] = self._build_animate(self.content)
+        self._pages["text"] = self._build_text(self.content)
+        self._pages["music"] = self._build_music(self.content)
         self._pages["bridge"] = self._build_bridge(self.content)
         self._pages["debug"] = self._build_debug(self.content)
         self._pages["settings"] = self._build_settings(self.content)
@@ -274,6 +425,18 @@ class MiLedApp(ctk.CTk):
             self._draw_canvas.set_pixels(self.pixels)
         elif key == "animate":
             self._load_anim_panel_to_canvas()
+        elif key == "music":
+            self._music_status_var.set(
+                self._audio.system_audio_hint()
+                if self._music_source.get() == "System audio"
+                else (
+                    "Listening…"
+                    if self._music_listening
+                    else "Start listening to preview reactive modes on the matrix."
+                )
+            )
+        elif key == "text":
+            self._refresh_text_preview()
 
     # ------------------------------------------------------------------ pages
 
@@ -360,7 +523,7 @@ class MiLedApp(ctk.CTk):
         ctk.CTkButton(toolbar, text="Clear", width=80, command=self._clear_canvas).pack(
             side="left", padx=4, pady=8
         )
-        ctk.CTkButton(toolbar, text="Upload Image...", command=self._upload_image).pack(
+        ctk.CTkButton(toolbar, text="Upload…", width=80, command=self._upload_image).pack(
             side="left", padx=(16, 4), pady=8
         )
         ctk.CTkButton(toolbar, text="Save…", width=70, command=self._export_drawing).pack(
@@ -379,6 +542,7 @@ class MiLedApp(ctk.CTk):
         ctk.CTkSwitch(
             toolbar, text="Live update", variable=self.live_update, command=self._on_live_toggled
         ).pack(side="left", padx=(16, 4), pady=8)
+        self._pack_fx_sliders(toolbar)
         ctk.CTkButton(toolbar, text="Send to Display", width=140, command=self._send_frame).pack(
             side="right", padx=8, pady=8
         )
@@ -449,6 +613,7 @@ class MiLedApp(ctk.CTk):
         ctk.CTkButton(panels, text="Stop", command=self._anim_stop).pack(
             fill="x", padx=10, pady=4
         )
+        self._pack_fx_sliders(panels, fill=True)
         ctk.CTkLabel(panels, text="Presets").pack(anchor="w", padx=10, pady=(14, 4))
         ctk.CTkOptionMenu(
             panels,
@@ -481,7 +646,7 @@ class MiLedApp(ctk.CTk):
         ctk.CTkButton(toolbar, text="Clear Panel", width=100, command=self._anim_clear_panel).pack(
             side="left", padx=4, pady=8
         )
-        ctk.CTkButton(toolbar, text="Upload Image...", command=self._anim_upload).pack(
+        ctk.CTkButton(toolbar, text="Upload…", width=80, command=self._anim_upload).pack(
             side="left", padx=(12, 4), pady=8
         )
         ctk.CTkButton(toolbar, text="Import…", width=80, command=self._import_animation).pack(
@@ -509,6 +674,231 @@ class MiLedApp(ctk.CTk):
         )
         self._animate_canvas.pack(padx=12, pady=12)
         self._refresh_anim_panel_menu()
+        return page
+
+    def _build_text(self, parent: ctk.CTkFrame) -> ctk.CTkFrame:
+        page = ctk.CTkFrame(parent, fg_color="transparent")
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(page, text="Text", font=ctk.CTkFont(size=22, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(8, 4)
+        )
+
+        body = ctk.CTkFrame(page)
+        body.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        preview_wrap = ctk.CTkFrame(body)
+        preview_wrap.grid(row=0, column=0, sticky="nw", padx=16, pady=16)
+        ctk.CTkLabel(preview_wrap, text="LED preview (import only)").pack(
+            anchor="w", padx=8, pady=(8, 0)
+        )
+        self._text_canvas = MatrixCanvas(
+            preview_wrap,
+            cell_size=28,
+            editable=False,
+            preview_style=self._preview_style,
+        )
+        self._text_canvas.pack(padx=8, pady=8)
+
+        controls = ctk.CTkFrame(body)
+        controls.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=16)
+        controls.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            controls,
+            text="Overlay text on an imported solid color, image, or animation. "
+            "The preview cannot be drawn on — use Import for backgrounds.",
+            wraplength=440,
+            justify="left",
+            text_color=("gray35", "gray65"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 8))
+
+        ctk.CTkLabel(controls, text="Line 1").grid(row=1, column=0, sticky="w", padx=12, pady=8)
+        entry1 = ctk.CTkEntry(controls, textvariable=self._text_line1, width=260)
+        entry1.grid(row=1, column=1, sticky="ew", padx=8, pady=8)
+        entry1.bind("<KeyRelease>", lambda _e: self._refresh_text_preview())
+
+        ctk.CTkLabel(controls, text="Line 2").grid(row=2, column=0, sticky="w", padx=12, pady=8)
+        entry2 = ctk.CTkEntry(controls, textvariable=self._text_line2, width=260)
+        entry2.grid(row=2, column=1, sticky="ew", padx=8, pady=8)
+        entry2.bind("<KeyRelease>", lambda _e: self._refresh_text_preview())
+
+        ctk.CTkLabel(controls, text="Text color").grid(
+            row=3, column=0, sticky="w", padx=12, pady=8
+        )
+        color_row = ctk.CTkFrame(controls, fg_color="transparent")
+        color_row.grid(row=3, column=1, sticky="w", padx=8, pady=8)
+        self._text_color_btn = ctk.CTkButton(
+            color_row,
+            text="",
+            width=40,
+            height=28,
+            fg_color=rgb_to_hex(*self._text_color),
+            hover=False,
+            command=self._pick_text_color,
+        )
+        self._text_color_btn.pack(side="left")
+        ctk.CTkButton(color_row, text="Pick…", width=70, command=self._pick_text_color).pack(
+            side="left", padx=8
+        )
+
+        ctk.CTkLabel(controls, text="Size").grid(row=4, column=0, sticky="w", padx=12, pady=8)
+        ctk.CTkOptionMenu(
+            controls,
+            variable=self._text_scale_label,
+            values=["0.5", "0.7", "1", "2", "3"],
+            width=80,
+            command=self._on_text_scale_changed,
+        ).grid(row=4, column=1, sticky="w", padx=8, pady=8)
+
+        ctk.CTkLabel(controls, text="Background").grid(
+            row=5, column=0, sticky="w", padx=12, pady=8
+        )
+        bg_row = ctk.CTkFrame(controls, fg_color="transparent")
+        bg_row.grid(row=5, column=1, sticky="w", padx=8, pady=8)
+        ctk.CTkOptionMenu(
+            bg_row,
+            variable=self._text_bg_mode,
+            values=["Solid", "Image", "Animation"],
+            width=120,
+            command=self._on_text_bg_mode_changed,
+        ).pack(side="left")
+        self._text_bg_color_btn = ctk.CTkButton(
+            bg_row,
+            text="",
+            width=40,
+            height=28,
+            fg_color=rgb_to_hex(*self._text_bg_color),
+            hover=False,
+            command=self._pick_text_bg_color,
+        )
+        self._text_bg_color_btn.pack(side="left", padx=(8, 4))
+        ctk.CTkButton(bg_row, text="Import…", width=90, command=self._text_import_background).pack(
+            side="left", padx=4
+        )
+
+        ctk.CTkSwitch(
+            controls,
+            text="Scroll when a line is wider than the panel",
+            variable=self._text_scroll,
+            command=self._refresh_text_preview,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=12, pady=8)
+
+        self._pack_fx_sliders(controls, grid=True, row=7)
+
+        btns = ctk.CTkFrame(controls, fg_color="transparent")
+        btns.grid(row=8, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 16))
+        ctk.CTkButton(
+            btns, text="Refresh Preview", width=130, command=self._refresh_text_preview
+        ).pack(side="left", padx=(0, 8))
+        self._text_play_btn = ctk.CTkButton(
+            btns, text="Play on Display", width=140, command=self._text_toggle_play
+        )
+        self._text_play_btn.pack(side="left", padx=4)
+
+        self._refresh_text_preview()
+        return page
+
+    def _build_music(self, parent: ctk.CTkFrame) -> ctk.CTkFrame:
+        page = ctk.CTkFrame(parent, fg_color="transparent")
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(page, text="Music", font=ctk.CTkFont(size=22, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(8, 4)
+        )
+
+        body = ctk.CTkFrame(page)
+        body.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(1, weight=1)
+
+        preview_wrap = ctk.CTkFrame(body)
+        preview_wrap.grid(row=0, column=0, rowspan=2, padx=16, pady=16, sticky="nw")
+        ctk.CTkLabel(preview_wrap, text="LED preview").pack(anchor="w", padx=8, pady=(8, 0))
+        self._music_canvas = MatrixCanvas(
+            preview_wrap,
+            cell_size=28,
+            editable=False,
+            preview_style=self._preview_style,
+        )
+        self._music_canvas.pack(padx=8, pady=8)
+        self._music_canvas.set_pixels(blank_frame())
+        ctk.CTkLabel(
+            preview_wrap,
+            textvariable=self._music_level_var,
+            text_color=("gray35", "gray65"),
+        ).pack(anchor="w", padx=8, pady=(0, 8))
+
+        controls = ctk.CTkFrame(body)
+        controls.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=16)
+        controls.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            controls,
+            text="Reactive visuals from microphone or system audio. "
+            "The panel updates ~5×/sec (BLE limit); preview is faster.",
+            wraplength=420,
+            justify="left",
+            text_color=("gray35", "gray65"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 8))
+
+        ctk.CTkLabel(controls, text="Source").grid(row=1, column=0, sticky="w", padx=12, pady=8)
+        ctk.CTkOptionMenu(
+            controls,
+            variable=self._music_source,
+            values=["Microphone", "System audio"],
+            width=180,
+            command=self._on_music_source_changed,
+        ).grid(row=1, column=1, sticky="w", padx=8, pady=8)
+
+        ctk.CTkLabel(controls, text="Mode").grid(row=2, column=0, sticky="w", padx=12, pady=8)
+        ctk.CTkOptionMenu(
+            controls,
+            variable=self._music_mode,
+            values=MUSIC_MODE_LABELS,
+            width=180,
+        ).grid(row=2, column=1, sticky="w", padx=8, pady=8)
+
+        ctk.CTkLabel(controls, text="Sensitivity").grid(
+            row=3, column=0, sticky="w", padx=12, pady=8
+        )
+        ctk.CTkSlider(
+            controls,
+            from_=0.4,
+            to=2.2,
+            number_of_steps=18,
+            variable=self._music_sensitivity,
+            width=220,
+        ).grid(row=3, column=1, sticky="w", padx=8, pady=8)
+
+        self._pack_fx_sliders(controls, grid=True, row=4)
+
+        btns = ctk.CTkFrame(controls, fg_color="transparent")
+        btns.grid(row=5, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 8))
+        self._music_listen_btn = ctk.CTkButton(
+            btns, text="Start Listening", width=140, command=self._music_toggle_listen
+        )
+        self._music_listen_btn.pack(side="left", padx=(0, 8))
+        self._music_display_btn = ctk.CTkButton(
+            btns,
+            text="Play on Display",
+            width=140,
+            command=self._music_toggle_display,
+            state="disabled",
+        )
+        self._music_display_btn.pack(side="left", padx=4)
+
+        ctk.CTkLabel(
+            controls,
+            textvariable=self._music_status_var,
+            wraplength=420,
+            justify="left",
+            text_color=("gray35", "gray65"),
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 16))
         return page
 
     def _build_bridge(self, parent: ctk.CTkFrame) -> ctk.CTkFrame:
@@ -595,6 +985,14 @@ class MiLedApp(ctk.CTk):
             width=140,
             command=self._scan_bridge_sessions,
         ).pack(side="left", padx=(12, 0))
+        self.connect_btn = ctk.CTkButton(
+            row, text="Connect", width=100, command=self._on_connect
+        )
+        self.connect_btn.pack(side="left", padx=(8, 0))
+        self.disconnect_btn = ctk.CTkButton(
+            row, text="Disconnect", width=100, command=self._on_disconnect, state="disabled"
+        )
+        self.disconnect_btn.pack(side="left", padx=(8, 0))
         self._update_proxy_fields()
 
         self._bridge_log = ctk.CTkTextbox(body, height=180)
@@ -861,6 +1259,92 @@ class MiLedApp(ctk.CTk):
     def _queue_status(self, message: str) -> None:
         self.after(0, lambda m=message: self._set_status(m))
 
+    def _queue_connection_lost(self) -> None:
+        self.after(0, self._on_connection_lost)
+
+    def _stop_reconnect(self) -> None:
+        if self._reconnect_job is not None:
+            try:
+                self.after_cancel(self._reconnect_job)
+            except Exception:
+                pass
+            self._reconnect_job = None
+
+    def _schedule_reconnect(self, delay_ms: int = 5000) -> None:
+        if self._closing or not self._want_connection:
+            return
+        if self._reconnect_job is not None:
+            return
+        self._reconnect_job = self.after(max(0, int(delay_ms)), self._reconnect_tick)
+
+    def _on_connection_lost(self) -> None:
+        if self._closing or not self._want_connection:
+            return
+        if self.device.is_connected:
+            return
+        self._stop_keepalive()
+        if self._anim_playing and not self._anim_preview_only:
+            self._anim_stop()
+        self._set_status("Connection lost — reconnecting in 5s…")
+        self._schedule_reconnect(5000)
+
+    def _connection_watch(self) -> None:
+        """Fallback poll in case Bleak/proxy callbacks miss a drop."""
+        self._connection_watch_job = None
+        if self._closing:
+            return
+        try:
+            if (
+                self._want_connection
+                and not self._busy
+                and not self.device.is_connected
+                and self._reconnect_job is None
+            ):
+                self._on_connection_lost()
+        finally:
+            if not self._closing:
+                self._connection_watch_job = self.after(2000, self._connection_watch)
+
+    def _reconnect_tick(self) -> None:
+        self._reconnect_job = None
+        if self._closing or not self._want_connection:
+            return
+        if self.device.is_connected:
+            return
+        if self._busy:
+            self._schedule_reconnect(1000)
+            return
+        self._ensure_usable_transport()
+        try:
+            self._apply_transport()
+        except ValueError as exc:
+            self._set_status(f"Reconnect paused: {exc}")
+            self._schedule_reconnect(5000)
+            return
+
+        self._set_busy(True)
+        if self._is_proxy_mode():
+            self._set_status("Reconnecting to proxy…")
+        else:
+            self._set_status("Reconnecting to MI Matrix Display…")
+        fut = self.device.connect()
+
+        def done() -> None:
+            try:
+                ok = fut.result(timeout=60)
+            except Exception as exc:
+                self._set_status(f"Reconnect failed ({exc}) — retrying in 5s…")
+                ok = False
+            self._set_busy(False)
+            if ok:
+                self._set_status(f"Reconnected to {self.device.device_label}")
+                self.after(50, self._restore_display_after_connect)
+            elif self._want_connection and not self._closing:
+                self._set_status("Not connected — retrying in 5s…")
+                self._schedule_reconnect(5000)
+
+        self.after(100, self._poll_future, fut, done)
+
     def _debug_textbox_key(self, event) -> Optional[str]:
         """Allow navigation/copy shortcuts; block typing into the debug log."""
         # Cmd (macOS) or Ctrl modifiers for copy/select-all/find-ish keys.
@@ -1065,6 +1549,25 @@ class MiLedApp(ctk.CTk):
     def _is_proxy_mode(self) -> bool:
         return self.connection_mode.get() == "BLE Proxy"
 
+    def _proxy_is_localhost(self) -> bool:
+        host = self.proxy_host.get().strip().lower()
+        return host in {"127.0.0.1", "localhost", "::1"}
+
+    def _ensure_usable_transport(self) -> None:
+        """
+        Proxy → 127.0.0.1 only works while this app's bridge is running.
+        After a restart (or if the bridge was never started), fall back to Local BLE
+        so the GUI can find the display again.
+        """
+        if self._is_proxy_mode() and self._proxy_is_localhost() and not self._bridge_running:
+            self.connection_mode.set("Local BLE")
+            self._update_proxy_fields()
+            try:
+                self.settings.connection_mode = "local"
+                save_settings(self.settings)
+            except Exception:
+                pass
+
     def _proxy_url(self) -> str:
         host = self.proxy_host.get().strip() or "127.0.0.1"
         try:
@@ -1097,22 +1600,37 @@ class MiLedApp(ctk.CTk):
             self.device.configure(mode="local")
 
     def _auto_connect(self) -> None:
-        if not self._is_proxy_mode():
-            self._on_connect()
+        # Prefer local Bluetooth on this machine. Proxy mode is only for driving
+        # a remote bridge (or this app's own bridge via 127.0.0.1).
+        self._ensure_usable_transport()
+        if self._is_proxy_mode():
+            host = self.proxy_host.get().strip()
+            if not host:
+                self._set_status("Proxy mode — enter host and Connect")
+                return
+            self._set_status(f"Connecting to proxy {host}…")
         else:
-            self._set_status("Proxy mode — enter host and Connect")
+            self._set_status("Scanning for MI Matrix Display…")
+        self._on_connect()
 
     def _on_connect(self) -> None:
         if self._busy:
             return
+        self._want_connection = True
+        self._stop_reconnect()
+        self._ensure_usable_transport()
         try:
             self._apply_transport()
         except ValueError as exc:
             messagebox.showerror("Proxy settings", str(exc))
+            self._schedule_reconnect(5000)
             return
 
         self._set_busy(True)
-        self._set_status("Connecting...")
+        if self._is_proxy_mode():
+            self._set_status(f"Connecting to proxy {self.proxy_host.get().strip()}…")
+        else:
+            self._set_status("Scanning for MI Matrix Display…")
         fut = self.device.connect()
 
         def done() -> None:
@@ -1127,8 +1645,9 @@ class MiLedApp(ctk.CTk):
                 # Don't enter graffiti here — init clears the panel. Live draws
                 # enter graffiti on demand and restore the canvas afterward.
                 self.after(50, self._restore_display_after_connect)
-            else:
-                self._set_status("Not connected — click Connect to retry")
+            elif self._want_connection and not self._closing:
+                self._set_status("Not connected — retrying in 5s…")
+                self._schedule_reconnect(5000)
 
         self.after(100, self._poll_future, fut, done)
 
@@ -1173,6 +1692,8 @@ class MiLedApp(ctk.CTk):
         self.after(100, self._poll_future, fut, done)
 
     def _on_disconnect(self) -> None:
+        self._want_connection = False
+        self._stop_reconnect()
         self._stop_keepalive()
         fut = self.device.disconnect()
         self.after(100, self._poll_future, fut, lambda: self._set_status("Disconnected"))
@@ -1197,6 +1718,68 @@ class MiLedApp(ctk.CTk):
             return True
         messagebox.showinfo("Not connected", "Connect to the MI Matrix Display first.")
         return False
+
+    def _pack_fx_sliders(
+        self,
+        parent,
+        *,
+        fill: bool = False,
+        grid: bool = False,
+        row: int = 0,
+    ) -> None:
+        """Shared Speed / Brightness controls for tabs that drive the display."""
+        box = ctk.CTkFrame(parent, fg_color="transparent")
+        if grid:
+            box.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=8)
+            box.grid_columnconfigure(1, weight=1)
+            box.grid_columnconfigure(3, weight=1)
+            ctk.CTkLabel(box, text="Speed").grid(row=0, column=0, sticky="w", padx=(0, 6))
+            ctk.CTkSlider(
+                box, from_=0.4, to=2.0, number_of_steps=16, variable=self._fx_speed, width=120
+            ).grid(row=0, column=1, sticky="w", padx=(0, 16))
+            ctk.CTkLabel(box, text="Bright").grid(row=0, column=2, sticky="w", padx=(0, 6))
+            ctk.CTkSlider(
+                box,
+                from_=0.15,
+                to=1.0,
+                number_of_steps=17,
+                variable=self._fx_brightness,
+                width=120,
+                command=lambda _v: self._on_fx_brightness_changed(),
+            ).grid(row=0, column=3, sticky="w")
+            return
+
+        if fill:
+            box.pack(fill="x", padx=10, pady=(10, 4))
+        else:
+            box.pack(side="left", padx=(12, 4), pady=8)
+        ctk.CTkLabel(box, text="Speed").pack(side="left", padx=(0, 4))
+        ctk.CTkSlider(
+            box, from_=0.4, to=2.0, number_of_steps=16, variable=self._fx_speed, width=90
+        ).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(box, text="Bright").pack(side="left", padx=(0, 4))
+        ctk.CTkSlider(
+            box,
+            from_=0.15,
+            to=1.0,
+            number_of_steps=17,
+            variable=self._fx_brightness,
+            width=90,
+            command=lambda _v: self._on_fx_brightness_changed(),
+        ).pack(side="left")
+
+    def _on_fx_brightness_changed(self) -> None:
+        if self._current_page == "text":
+            self._refresh_text_preview()
+
+    def _speed_ms(self, base_ms: int) -> int:
+        speed = max(0.25, float(self._fx_speed.get()))
+        return max(10, int(base_ms / speed))
+
+    def _brighten_frame(
+        self, frame: list[tuple[int, int, int]]
+    ) -> list[tuple[int, int, int]]:
+        return apply_brightness(frame, float(self._fx_brightness.get()))
 
     # ------------------------------------------------------------------ power / clear
 
@@ -1372,7 +1955,7 @@ class MiLedApp(ctk.CTk):
     def _schedule_live_frame(self) -> None:
         if self._live_frame_job is not None:
             return
-        delay = max(10, int(self.settings.live_update_ms))
+        delay = self._speed_ms(int(self.settings.live_update_ms))
         self._live_frame_job = self.after(delay, self._send_live_frame)
 
     def _send_live_frame(self, force: bool = False) -> None:
@@ -1389,7 +1972,7 @@ class MiLedApp(ctk.CTk):
             return
 
         self._sync_pixels_from_draw()
-        frame = list(self.pixels)
+        frame = self._brighten_frame(list(self.pixels))
         fut = self.device.send_frame(frame)
         self._live_frame_inflight = True
         self._last_live_send = time.monotonic()
@@ -1432,7 +2015,7 @@ class MiLedApp(ctk.CTk):
         if self._anim_playing:
             self._anim_stop()
         self._sync_pixels_from_draw()
-        frame = list(self.pixels)
+        frame = self._brighten_frame(list(self.pixels))
         fut = self.device.send_frame(frame)
 
         def done() -> None:
@@ -1450,8 +2033,10 @@ class MiLedApp(ctk.CTk):
 
     def _upload_image(self) -> None:
         path = filedialog.askopenfilename(
-            title="Choose an image",
+            title="Upload drawing",
             filetypes=[
+                ("PNG image", "*.png"),
+                ("Python script", "*.py"),
                 ("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
                 ("All files", "*.*"),
             ],
@@ -1459,14 +2044,20 @@ class MiLedApp(ctk.CTk):
         if not path:
             return
         try:
-            self.pixels = load_image_as_matrix(path)
+            lower = path.lower()
+            if lower.endswith(".py"):
+                self.pixels = load_drawing_python(path)
+            elif lower.endswith(".png"):
+                self.pixels = load_frame_png(path)
+            else:
+                self.pixels = load_image_as_matrix(path)
         except Exception as exc:
-            messagebox.showerror("Image error", f"Could not load image:\n{exc}")
+            messagebox.showerror("Upload", f"Could not load file:\n{exc}")
             return
         if self._draw_canvas is not None:
             self._draw_canvas.set_pixels(self.pixels)
         self._sync_preview()
-        self._set_status(f"Loaded image: {path}")
+        self._set_status(f"Loaded: {Path(path).name}")
         self._schedule_workspace_save()
         if self.live_update.get() and self.device.is_connected:
             self._send_frame()
@@ -1573,8 +2164,10 @@ class MiLedApp(ctk.CTk):
 
     def _anim_upload(self) -> None:
         path = filedialog.askopenfilename(
-            title="Choose an image for this panel",
+            title="Upload panel",
             filetypes=[
+                ("PNG image", "*.png"),
+                ("Python script", "*.py"),
                 ("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
                 ("All files", "*.*"),
             ],
@@ -1582,9 +2175,21 @@ class MiLedApp(ctk.CTk):
         if not path:
             return
         try:
-            self.anim_frames[self.anim_index] = load_image_as_matrix(path)
+            lower = path.lower()
+            if lower.endswith(".py"):
+                # Drawing export → this panel; animation export → first panel.
+                try:
+                    frame = load_drawing_python(path)
+                except Exception:
+                    frames = load_animation_python(path)
+                    frame = frames[0]
+            elif lower.endswith(".png"):
+                frame = load_frame_png(path)
+            else:
+                frame = load_image_as_matrix(path)
+            self.anim_frames[self.anim_index] = frame
         except Exception as exc:
-            messagebox.showerror("Image error", f"Could not load image:\n{exc}")
+            messagebox.showerror("Upload", f"Could not load file:\n{exc}")
             return
         self._load_anim_panel_to_canvas()
         if self.anim_index < len(self._anim_thumbs):
@@ -1638,6 +2243,7 @@ class MiLedApp(ctk.CTk):
         frame_ms: Optional[int] = None,
         label: Optional[str] = None,
     ) -> None:
+        self._text_stop_play()
         self._anim_stop()
         self._anim_generation += 1
         gen = self._anim_generation
@@ -1698,6 +2304,374 @@ class MiLedApp(ctk.CTk):
             self._anim_job = None
         if was_playing and not was_preview and not self._closing:
             self._schedule_workspace_save()
+        if self._music_on_display:
+            self._music_on_display = False
+            if self._music_display_btn is not None:
+                self._music_display_btn.configure(text="Play on Display")
+        if self._text_playing:
+            self._text_playing = False
+            if self._text_play_btn is not None:
+                self._text_play_btn.configure(text="Play on Display")
+            if self._text_job is not None:
+                try:
+                    self.after_cancel(self._text_job)
+                except Exception:
+                    pass
+                self._text_job = None
+
+    # ------------------------------------------------------------------ text
+
+    def _text_scale(self) -> float:
+        try:
+            return float(self._text_scale_label.get())
+        except ValueError:
+            return 1.0
+
+    def _text_content(self) -> str:
+        line1 = self._text_line1.get().strip()
+        line2 = self._text_line2.get().strip()
+        if line2:
+            return f"{line1}\n{line2}"
+        return line1
+
+    def _on_text_scale_changed(self, _value: str | None = None) -> None:
+        self._refresh_text_preview()
+
+    def _pick_text_color(self) -> None:
+        result = colorchooser.askcolor(
+            color=rgb_to_hex(*self._text_color), title="Text color"
+        )
+        if not result or not result[0]:
+            return
+        r, g, b = (int(c) for c in result[0])
+        self._text_color = (r, g, b)
+        if self._text_color_btn is not None:
+            self._text_color_btn.configure(fg_color=rgb_to_hex(r, g, b))
+        self._refresh_text_preview()
+
+    def _pick_text_bg_color(self) -> None:
+        result = colorchooser.askcolor(
+            color=rgb_to_hex(*self._text_bg_color), title="Background color"
+        )
+        if not result or not result[0]:
+            return
+        r, g, b = (int(c) for c in result[0])
+        self._text_bg_color = (r, g, b)
+        if self._text_bg_color_btn is not None:
+            self._text_bg_color_btn.configure(fg_color=rgb_to_hex(r, g, b))
+        self._text_bg_mode.set("Solid")
+        self._text_bg_frames = [blank_frame(self._text_bg_color)]
+        self._refresh_text_preview()
+
+    def _on_text_bg_mode_changed(self, _value: str | None = None) -> None:
+        mode = self._text_bg_mode.get()
+        if mode == "Solid":
+            self._text_bg_frames = [blank_frame(self._text_bg_color)]
+            self._refresh_text_preview()
+        else:
+            self._set_status(f"Text background: {mode} — use Import… to load a file")
+
+    def _text_import_background(self) -> None:
+        mode = self._text_bg_mode.get()
+        if mode == "Solid":
+            self._pick_text_bg_color()
+            return
+        if mode == "Image":
+            path = filedialog.askopenfilename(
+                title="Import text background image",
+                filetypes=[
+                    ("PNG image", "*.png"),
+                    ("Python script", "*.py"),
+                    ("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if not path:
+                return
+            try:
+                lower = path.lower()
+                if lower.endswith(".py"):
+                    frame = load_drawing_python(path)
+                elif lower.endswith(".png"):
+                    frame = load_frame_png(path)
+                else:
+                    frame = load_image_as_matrix(path)
+                self._text_bg_frames = [frame]
+            except Exception as exc:
+                messagebox.showerror("Text", f"Could not import image:\n{exc}")
+                return
+            self._refresh_text_preview()
+            self._set_status(f"Text background image: {Path(path).name}")
+            return
+
+        # Animation
+        path = filedialog.askopenfilename(
+            title="Import text background animation",
+            filetypes=[
+                ("Python script", "*.py"),
+                ("GIF animation", "*.gif"),
+                ("ZIP of PNGs", "*.zip"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            lower = path.lower()
+            if lower.endswith(".py"):
+                frames = load_animation_python(path)
+            elif lower.endswith(".zip"):
+                frames = load_animation_zip(path)
+            else:
+                frames = load_animation_gif(path)
+            self._text_bg_frames = frames
+            self._text_bg_mode.set("Animation")
+        except Exception as exc:
+            messagebox.showerror("Text", f"Could not import animation:\n{exc}")
+            return
+        self._refresh_text_preview()
+        self._set_status(f"Text background animation: {Path(path).name} ({len(frames)} frames)")
+
+    def _text_compose_frame(self, tick: int = 0) -> list[tuple[int, int, int]]:
+        frames = self._text_bg_frames or [blank_frame(self._text_bg_color)]
+        if self._text_bg_mode.get() == "Solid":
+            bg = blank_frame(self._text_bg_color)
+        else:
+            bg = frames[tick % len(frames)]
+        scale = self._text_scale()
+        text = self._text_content()
+        scroll_x = 0
+        width = max_line_width(text, scale=scale)
+        if self._text_scroll.get() and width > MATRIX_SIZE:
+            # Continuous marquee: enter from the right, exit left, then keep
+            # scrolling through one full panel of empty (background-only) space
+            # before the text comes back in — no hard reset to the left edge.
+            gap = MATRIX_SIZE
+            period = width + MATRIX_SIZE + gap
+            offset = tick % period
+            # render_text_frame draws at x = -scroll_x; we want draw_x =
+            # MATRIX_SIZE - offset (off-right at offset 0).
+            scroll_x = offset - MATRIX_SIZE
+        return self._brighten_frame(
+            render_text_frame(
+                text=text,
+                color=self._text_color,
+                scale=scale,
+                background=bg,
+                scroll_x=scroll_x,
+            )
+        )
+
+    def _refresh_text_preview(self) -> None:
+        frame = self._text_compose_frame(self._text_tick)
+        if self._text_canvas is not None:
+            self._text_canvas.set_pixels_fast(frame)
+        if self._preview is not None and self._current_page == "home" and self._text_playing:
+            self._preview.set_pixels_fast(frame)
+
+    def _text_toggle_play(self) -> None:
+        if self._text_playing:
+            self._text_stop_play()
+        else:
+            self._text_start_play()
+
+    def _text_start_play(self) -> None:
+        if not self._require_connection():
+            return
+        self._anim_stop()
+        if self._music_on_display:
+            self._music_stop_display()
+        self._text_playing = True
+        self._text_tick = 0
+        self._stop_keepalive()
+        self._powered_on = True
+        if self._text_play_btn is not None:
+            self._text_play_btn.configure(text="Stop")
+        self._set_status("Playing text on display…")
+        self._text_tick_once()
+
+    def _text_stop_play(self) -> None:
+        was = self._text_playing
+        self._text_playing = False
+        if self._text_job is not None:
+            try:
+                self.after_cancel(self._text_job)
+            except Exception:
+                pass
+            self._text_job = None
+        if self._text_play_btn is not None:
+            self._text_play_btn.configure(text="Play on Display")
+        if was:
+            self._set_status("Text playback stopped")
+
+    def _text_tick_once(self) -> None:
+        if not self._text_playing:
+            return
+        if not self.device.is_connected:
+            self._text_stop_play()
+            self._set_status("Text stopped — disconnected")
+            return
+        frame = self._text_compose_frame(self._text_tick)
+        self._text_tick += 1
+        if self._text_canvas is not None:
+            self._text_canvas.set_pixels_fast(frame)
+        if self._preview is not None and self._current_page == "home":
+            self._preview.set_pixels_fast(frame)
+        fut = self.device.send_frame(frame)
+        self._display_frame = list(frame)
+
+        def after_send() -> None:
+            if not self._text_playing:
+                return
+            try:
+                fut.result(timeout=0)
+            except Exception as exc:
+                self._text_stop_play()
+                self._set_status(f"Text error: {exc}")
+                return
+            delay = self._speed_ms(200)
+            self._text_job = self.after(delay, self._text_tick_once)
+
+        self.after(40, self._poll_future, fut, after_send)
+
+    def _on_music_source_changed(self, _value: str | None = None) -> None:
+        if self._music_source.get() == "System audio":
+            self._music_status_var.set(self._audio.system_audio_hint())
+        else:
+            self._music_status_var.set("Microphone selected.")
+        if self._music_listening:
+            on_display = self._music_on_display
+            self._music_stop_listen()
+            self._music_start_listen()
+            if on_display and self._music_listening:
+                self._music_start_display()
+
+    def _music_render_frame(self) -> list[tuple[int, int, int]]:
+        # Brightness is applied in _anim_tick when sending / showing.
+        return render_mode(
+            self._music_mode.get(),
+            self._audio.features(),
+            float(self._music_sensitivity.get()),
+        )
+
+    def _music_toggle_listen(self) -> None:
+        if self._music_listening:
+            self._music_stop_listen()
+        else:
+            self._music_start_listen()
+
+    def _music_start_listen(self) -> None:
+        if not audio_available():
+            messagebox.showerror(
+                "Music",
+                "Audio packages are missing.\nInstall with:\npip install sounddevice numpy",
+            )
+            return
+        source = "system" if self._music_source.get() == "System audio" else "microphone"
+        try:
+            self._audio.start(source=source)
+        except Exception as exc:
+            self._music_status_var.set(str(exc))
+            messagebox.showerror("Music", str(exc))
+            return
+        self._music_listening = True
+        if self._music_listen_btn is not None:
+            self._music_listen_btn.configure(text="Stop Listening")
+        if self._music_display_btn is not None:
+            self._music_display_btn.configure(state="normal")
+        self._music_status_var.set("Listening — preview updating on the LED matrix view.")
+        self._set_status("Music listening started")
+        self._schedule_music_preview()
+
+    def _music_stop_listen(self) -> None:
+        if self._music_on_display:
+            self._music_stop_display()
+        self._music_listening = False
+        self._audio.stop()
+        if self._music_preview_job is not None:
+            try:
+                self.after_cancel(self._music_preview_job)
+            except Exception:
+                pass
+            self._music_preview_job = None
+        if self._music_listen_btn is not None:
+            self._music_listen_btn.configure(text="Start Listening")
+        if self._music_display_btn is not None:
+            self._music_display_btn.configure(state="disabled", text="Play on Display")
+        self._music_level_var.set("Level: —")
+        self._music_status_var.set("Stopped.")
+        if self._music_canvas is not None:
+            self._music_canvas.set_pixels(blank_frame())
+        self._set_status("Music listening stopped")
+
+    def _schedule_music_preview(self) -> None:
+        if self._music_preview_job is not None:
+            try:
+                self.after_cancel(self._music_preview_job)
+            except Exception:
+                pass
+        self._music_preview_job = self.after(70, self._music_preview_tick)
+
+    def _music_preview_tick(self) -> None:
+        self._music_preview_job = None
+        if not self._music_listening or self._closing:
+            return
+        features = self._audio.features()
+        frame = self._brighten_frame(
+            render_mode(
+                self._music_mode.get(), features, float(self._music_sensitivity.get())
+            )
+        )
+        self._music_level_var.set(
+            f"Level: {features.level:.2f}   Bass: {features.bass:.2f}"
+        )
+        if self._music_canvas is not None:
+            self._music_canvas.set_pixels_fast(frame)
+        if (
+            self._preview is not None
+            and self._current_page == "home"
+            and self._music_on_display
+        ):
+            self._preview.set_pixels_fast(frame)
+        self._schedule_music_preview()
+
+    def _music_toggle_display(self) -> None:
+        if self._music_on_display:
+            self._music_stop_display()
+        else:
+            self._music_start_display()
+
+    def _music_start_display(self) -> None:
+        if not self._music_listening:
+            self._music_start_listen()
+            if not self._music_listening:
+                return
+        if not self._require_connection():
+            return
+        self._music_on_display = True
+        if self._music_display_btn is not None:
+            self._music_display_btn.configure(text="Stop Display")
+        self._start_animation(
+            preview_only=False,
+            live_fn=lambda _tick: self._music_render_frame(),
+            frame_ms=self._speed_ms(200),
+            label="Music",
+        )
+        self._music_status_var.set(
+            "Playing on display (~5 fps over BLE). Preview stays snappier."
+        )
+
+    def _music_stop_display(self) -> None:
+        self._music_on_display = False
+        if self._music_display_btn is not None:
+            self._music_display_btn.configure(text="Play on Display")
+        if self._anim_playing and self._active_preset_label == "Music":
+            self._anim_stop()
+        self._music_status_var.set(
+            "Display playback stopped. Preview continues while listening."
+            if self._music_listening
+            else "Stopped."
+        )
 
     def _update_anim_ui_frame(self, frame: list[tuple[int, int, int]]) -> None:
         """Throttle expensive canvas redraws during playback (~8–10 UI fps)."""
@@ -1733,17 +2707,22 @@ class MiLedApp(ctk.CTk):
                 self._set_status(f"Live preset error: {exc}")
                 return
             self._live_preset_tick += 1
-            delay = max(10, int(self._live_preset_ms or self.settings.animation_frame_ms))
+            delay = self._speed_ms(
+                int(self._live_preset_ms or self.settings.animation_frame_ms)
+            )
             next_index = index
         else:
             if not self.anim_frames:
                 self._anim_stop()
                 return
             frame = self.anim_frames[index % len(self.anim_frames)]
-            delay = max(10, int(self._live_preset_ms or self.settings.animation_frame_ms))
+            delay = self._speed_ms(
+                int(self._live_preset_ms or self.settings.animation_frame_ms)
+            )
             next_index = (index + 1) % len(self.anim_frames)
 
-        self._update_anim_ui_frame(frame)
+        shown = self._brighten_frame(frame)
+        self._update_anim_ui_frame(shown)
 
         if preview_only:
             # Local preview does not need 100 Hz ticks — that alone pegs a core.
@@ -1751,13 +2730,13 @@ class MiLedApp(ctk.CTk):
             self._anim_job = self.after(preview_delay, self._anim_tick, next_index, generation)
             return
 
-        if self._last_sent_frame is not None and frame == self._last_sent_frame:
+        if self._last_sent_frame is not None and shown == self._last_sent_frame:
             self._anim_job = self.after(delay, self._anim_tick, next_index, generation)
             return
 
-        fut = self.device.send_frame(frame)
-        self._last_sent_frame = list(frame)
-        self._display_frame = list(frame)
+        fut = self.device.send_frame(shown)
+        self._last_sent_frame = list(shown)
+        self._display_frame = list(shown)
         self._powered_on = True
 
         def after_send() -> None:
@@ -1868,26 +2847,95 @@ class MiLedApp(ctk.CTk):
             label=preset.label,
         )
 
+    def _confirm_non_python_save(self, format_label: str) -> str:
+        """
+        Warn before lossy image exports.
+
+        Returns: "format" | "python" | "cancel"
+        """
+        result = {"choice": "cancel"}
+        win = ctk.CTkToplevel(self)
+        win.title("Save Notice")
+        win.geometry("520x280")
+        win.transient(self)
+        win.grab_set()
+        win.focus_force()
+
+        ctk.CTkLabel(
+            win,
+            text="Save Notice",
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).pack(anchor="w", padx=18, pady=(16, 8))
+        ctk.CTkLabel(
+            win,
+            text=(
+                "When saving as an image, the app has to estimate the color of the image, "
+                "which is unpredictable and can change every time you upload it. It is "
+                "strongly recommended you save as a Python (.py) file as the script contains "
+                "the exact color codes of each pixel, making sure each import is the same "
+                "as the last."
+            ),
+            wraplength=480,
+            justify="left",
+            anchor="w",
+        ).pack(anchor="w", padx=18, pady=(0, 16))
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.pack(fill="x", padx=18, pady=(8, 18))
+
+        def choose(choice: str) -> None:
+            result["choice"] = choice
+            win.destroy()
+
+        ctk.CTkButton(
+            btns,
+            text=f"Save as {format_label} anyways",
+            width=200,
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=lambda: choose("format"),
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            btns,
+            text="Save as Python (.py)",
+            width=180,
+            command=lambda: choose("python"),
+        ).pack(side="right")
+
+        win.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+        self.wait_window(win)
+        return result["choice"]
+
     def _export_drawing(self) -> None:
         self._sync_pixels_from_draw()
         path = filedialog.asksaveasfilename(
             title="Save drawing",
-            defaultextension=".png",
+            defaultextension=".py",
             filetypes=[
-                ("PNG image", "*.png"),
                 ("Python script", "*.py"),
+                ("PNG image", "*.png"),
                 ("All files", "*.*"),
             ],
         )
         if not path:
             return
+        lower = path.lower()
+        if lower.endswith(".py"):
+            fmt = "py"
+        else:
+            fmt = "png"
+            if not lower.endswith(".png"):
+                path = path + ".png"
+            choice = self._confirm_non_python_save("PNG")
+            if choice == "cancel":
+                return
+            if choice == "python":
+                path = str(Path(path).with_suffix(".py"))
+                fmt = "py"
         try:
-            lower = path.lower()
-            if lower.endswith(".py"):
+            if fmt == "py":
                 save_drawing_python(path, self.pixels, name=Path(path).stem)
             else:
-                if not lower.endswith(".png"):
-                    path = path + ".png"
                 save_frame_png(path, self.pixels, scale=16)
             self._set_status(f"Saved drawing: {path}")
         except Exception as exc:
@@ -1902,29 +2950,47 @@ class MiLedApp(ctk.CTk):
 
         path = filedialog.asksaveasfilename(
             title="Save animation",
-            defaultextension=".gif",
+            defaultextension=".py",
             filetypes=[
+                ("Python script", "*.py"),
                 ("GIF animation", "*.gif"),
                 ("ZIP of PNGs", "*.zip"),
-                ("Python script", "*.py"),
                 ("All files", "*.*"),
             ],
         )
         if not path:
             return
+        lower = path.lower()
+        if lower.endswith(".py"):
+            fmt = "py"
+            format_label = "Python"
+        elif lower.endswith(".zip"):
+            fmt = "zip"
+            format_label = "ZIP"
+        else:
+            fmt = "gif"
+            format_label = "GIF"
+            if not lower.endswith(".gif"):
+                path = path + ".gif"
+
+        if fmt != "py":
+            choice = self._confirm_non_python_save(format_label)
+            if choice == "cancel":
+                return
+            if choice == "python":
+                path = str(Path(path).with_suffix(".py"))
+                fmt = "py"
+
         frames = [list(f) for f in self.anim_frames]
         frame_ms = int(self.settings.animation_frame_ms)
         try:
-            lower = path.lower()
-            if lower.endswith(".py"):
+            if fmt == "py":
                 save_animation_python(
                     path, frames, frame_ms=frame_ms, name=Path(path).stem
                 )
-            elif lower.endswith(".zip"):
+            elif fmt == "zip":
                 save_animation_zip(path, frames, scale=16)
             else:
-                if not lower.endswith(".gif"):
-                    path = path + ".gif"
                 save_animation_gif(path, frames, frame_ms=frame_ms, scale=16)
             self._set_status(f"Saved animation ({len(frames)} panels): {path}")
         except Exception as exc:
@@ -1934,9 +3000,10 @@ class MiLedApp(ctk.CTk):
         path = filedialog.askopenfilename(
             title="Import animation",
             filetypes=[
-                ("GIF / ZIP", "*.gif *.zip"),
+                ("Python script", "*.py"),
                 ("GIF animation", "*.gif"),
                 ("ZIP of PNGs", "*.zip"),
+                ("GIF / ZIP / Python", "*.gif *.zip *.py"),
                 ("All files", "*.*"),
             ],
         )
@@ -1944,7 +3011,9 @@ class MiLedApp(ctk.CTk):
             return
         try:
             lower = path.lower()
-            if lower.endswith(".zip"):
+            if lower.endswith(".py"):
+                frames = load_animation_python(path)
+            elif lower.endswith(".zip"):
                 frames = load_animation_zip(path)
             else:
                 frames = load_animation_gif(path)
@@ -2186,7 +3255,18 @@ class MiLedApp(ctk.CTk):
         self._bridge_append(f"Starting bridge on ws://{host}:{port}")
         for ip in self._lan_addresses():
             self._bridge_append(f"LAN URL: ws://{ip}:{port}")
-        self._set_status("BLE Bridge running")
+        self._set_status("BLE Bridge running — connecting this GUI via localhost…")
+
+        # Bridge owns Bluetooth; point this GUI at the local proxy so drawing
+        # / animations still work on the same machine.
+        self.connection_mode.set("BLE Proxy")
+        self.proxy_host.set("127.0.0.1")
+        self.proxy_port.set(str(port))
+        if token:
+            self.proxy_token.set(token)
+        self._update_proxy_fields()
+        self._persist_connection_settings()
+        self.after(600, self._on_connect)
 
     def _bridge_stop(self) -> None:
         server = self._bridge_server
@@ -2201,6 +3281,10 @@ class MiLedApp(ctk.CTk):
             self._bridge_append(f"Stop failed: {exc}")
 
     def _bridge_stopped_ui(self) -> None:
+        was_proxy_localhost = (
+            self._is_proxy_mode()
+            and self.proxy_host.get().strip() in {"127.0.0.1", "localhost"}
+        )
         self._bridge_running = False
         self._bridge_server = None
         self._bridge_loop = None
@@ -2208,7 +3292,17 @@ class MiLedApp(ctk.CTk):
         self._bridge_start_btn.configure(state="normal")
         self._bridge_stop_btn.configure(state="disabled")
         self._bridge_append("Bridge stopped")
-        self._set_status("BLE Bridge stopped")
+        if was_proxy_localhost:
+            # Return this machine to direct BLE now that the bridge released it.
+            if self.device.is_connected:
+                self._on_disconnect()
+            self.connection_mode.set("Local BLE")
+            self._update_proxy_fields()
+            self._persist_connection_settings()
+            self._set_status("BLE Bridge stopped — reconnecting locally…")
+            self.after(400, self._on_connect)
+        else:
+            self._set_status("BLE Bridge stopped")
 
     # ------------------------------------------------------------------ settings
 
@@ -2337,6 +3431,22 @@ class MiLedApp(ctk.CTk):
 
         self._anim_stop()
         self._stop_keepalive()
+        self._want_connection = False
+        self._stop_reconnect()
+        try:
+            self._music_stop_listen()
+        except Exception:
+            pass
+        try:
+            self._text_stop_play()
+        except Exception:
+            pass
+        if self._connection_watch_job is not None:
+            try:
+                self.after_cancel(self._connection_watch_job)
+            except Exception:
+                pass
+            self._connection_watch_job = None
         if self._live_frame_job is not None:
             try:
                 self.after_cancel(self._live_frame_job)
@@ -2354,9 +3464,14 @@ class MiLedApp(ctk.CTk):
         self._closing = True
         try:
             # Persist connection prefs on exit
+            self._ensure_usable_transport()
             self.settings.proxy_host = self.proxy_host.get().strip() or "127.0.0.1"
             self.settings.proxy_token = self.proxy_token.get()
-            self.settings.connection_mode = "proxy" if self._is_proxy_mode() else "local"
+            # Don't leave the next launch stuck on localhost proxy with no bridge.
+            if self._is_proxy_mode() and self._proxy_is_localhost() and not self._bridge_running:
+                self.settings.connection_mode = "local"
+            else:
+                self.settings.connection_mode = "proxy" if self._is_proxy_mode() else "local"
             try:
                 self.settings.proxy_port = int(self.proxy_port.get().strip() or DEFAULT_PROXY_PORT)
             except ValueError:

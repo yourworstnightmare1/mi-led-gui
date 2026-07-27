@@ -45,6 +45,7 @@ class AppSettings:
     preview_saturation: float = 1.05
     preview_yellow_push: float = 0.12
     preview_bloom: float = 0.0
+    hide_connection_notice: bool = False
 
     def clamp(self) -> "AppSettings":
         # Below ~10 ms the panel shows pixel shifts / laggy full-frame updates.
