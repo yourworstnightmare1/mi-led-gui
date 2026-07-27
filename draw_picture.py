@@ -117,44 +117,86 @@ async def send_picture(client: BleakClient, picture: list):
 
 async def main():
     print("Scanning for BLE devices...")
-    devices = await BleakScanner.discover()
+    devices = await BleakScanner.discover(timeout=10)
+
     target = None
 
+    #
+    # Pass 1: Original behavior (fast)
+    #
     for d in devices:
-        print(f"Found: {d.name} [{d.address}]")
         if d.name and "MI Matrix Display" in d.name:
+            print(f"Found by advertised name: {d.name} [{d.address}]")
             target = d
             break
+
+    #
+    # Pass 2: Fallback (connect to each device and inspect services)
+    #
+    if target is None:
+        print("Advertised name not found. Falling back to service discovery...\n")
+
+        for d in devices:
+            print(f"Checking: {d.name} [{d.address}]")
+
+            try:
+                async with BleakClient(d, timeout=5) as client:
+                    if not client.is_connected:
+                        continue
+
+                    print("  Connected")
+
+                    services = client.services
+
+                    # Compatibility with Bleak versions that require explicit discovery
+                    if not services:
+                        try:
+                            services = await client.get_services()
+                        except Exception:
+                            services = []
+
+                    for service in services:
+                        print(f"    {service.uuid}")
+
+                        if service.uuid.lower() == SERVICE_UUID.lower():
+                            print("\nFound compatible MI Matrix Display!")
+                            target = d
+                            break
+
+                    if target is not None:
+                        break
+
+            except Exception as e:
+                print(f"  Skipped ({e})")
 
     if target is None:
         print("MI Matrix Display not found.")
         return
 
     print(f"\nConnecting to {target.name} ({target.address})...")
+
     async with BleakClient(target) as client:
-        if client.is_connected:
-            print("Connected!")
-            # Optionally, list services for debugging:
-            for service in client.services:
-                print(f"Service: {service.uuid}")
-                for char in service.characteristics:
-                    print(f"  Characteristic: {char.uuid}")
+        if not client.is_connected:
+            print("Failed to connect.")
+            return
 
+        print("Connected!")
 
-            # Create the 16x16 image
-            picture0 = create_picture(0)
-            picture1 = create_picture(1)
+        picture0 = create_picture(0)
+        picture1 = create_picture(1)
 
-            #await send_picture(client, picture0)
+        try:
             while True:
-                # Send the full picture update in 8 blocks
                 await send_picture(client, picture0)
                 await asyncio.sleep(0.1)
                 await send_picture(client, picture1)
                 await asyncio.sleep(0.1)
-
-        else:
-            print("Failed to connect.")
+        except KeyboardInterrupt:
+            print("\nStopping...")
+            break
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nExiting...")
