@@ -1,2 +1,7 @@
-venv
-__pycache__/plasma.cpython-313.pyc
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+dist/
+build/
+*.spec
