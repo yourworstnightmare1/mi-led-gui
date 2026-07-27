@@ -27,10 +27,12 @@ class ProxyDevice:
         url: str = DEFAULT_PROXY_URL,
         token: Optional[str] = None,
         on_status: Optional[StatusCallback] = None,
+        on_debug: Optional[StatusCallback] = None,
     ):
         self.url = url
         self.token = token
         self._on_status = on_status or (lambda _msg: None)
+        self._on_debug = on_debug or (lambda _msg: None)
         self._ws = None
         self._connected = False
         self._label = "Remote proxy"
@@ -49,6 +51,9 @@ class ProxyDevice:
 
     def _status(self, message: str) -> None:
         self._on_status(message)
+
+    def _debug(self, message: str) -> None:
+        self._on_debug(message)
 
     async def _ensure_socket(self) -> None:
         if self._ws is not None:
@@ -105,6 +110,7 @@ class ProxyDevice:
             self._ws = None
 
     async def _request(self, cmd: str, **fields: Any) -> Any:
+        self._debug(f"PROXY TX cmd={cmd} fields={ {k: v for k, v in fields.items() if k != 'pixels'} }")
         async with self._lock:
             await self._ensure_socket()
             assert self._ws is not None
@@ -117,9 +123,12 @@ class ProxyDevice:
             await self._ws.send(dumps(payload))
 
         try:
-            return await asyncio.wait_for(fut, timeout=60)
+            result = await asyncio.wait_for(fut, timeout=60)
+            self._debug(f"PROXY RX cmd={cmd} ok")
+            return result
         except Exception:
             self._pending.pop(req_id, None)
+            self._debug(f"PROXY RX cmd={cmd} failed")
             raise
 
     async def connect(self, scan_timeout: float = 10.0) -> bool:
@@ -168,19 +177,55 @@ class ProxyDevice:
         self._status("Power on")
 
     async def power_off(self) -> None:
+        # Proxy host blanks via clear_screen (see MiLedDevice.power_off).
         await self._request("power_off")
         self._status("Power off")
 
     async def enter_graffiti_mode(self) -> None:
         await self._request("enter_graffiti")
 
-    async def set_pixel(self, x: int, y: int, r: int, g: int, b: int) -> None:
-        await self._request("set_pixel", x=x, y=y, r=r, g=g, b=b)
+    async def set_pixel(
+        self,
+        x: int,
+        y: int,
+        r: int,
+        g: int,
+        b: int,
+        canvas: list[tuple[int, int, int]] | None = None,
+    ) -> None:
+        fields: dict = {"x": x, "y": y, "r": r, "g": g, "b": b}
+        if canvas is not None:
+            fields["canvas"] = [[int(cr), int(cg), int(cb)] for cr, cg, cb in canvas]
+        await self._request("set_pixel", **fields)
+
+    async def sync_framebuffer(self, picture: list[tuple[int, int, int]]) -> None:
+        pixels = [[int(r), int(g), int(b)] for r, g, b in picture]
+        await self._request("sync_framebuffer", pixels=pixels)
 
     async def send_frame(self, picture: list[tuple[int, int, int]]) -> None:
         pixels = [[int(r), int(g), int(b)] for r, g, b in picture]
         await self._request("send_frame", pixels=pixels)
-        self._status("Frame sent")
+
+    async def clear_screen(self) -> None:
+        await self._request("clear_screen")
+        self._status("Screen cleared")
+
+    async def fade_frame(
+        self,
+        picture: list[tuple[int, int, int]],
+        *,
+        to_black: bool,
+        steps: int = 8,
+        step_delay: float = 0.04,
+    ) -> None:
+        pixels = [[int(r), int(g), int(b)] for r, g, b in picture]
+        await self._request(
+            "fade_frame",
+            pixels=pixels,
+            to_black=to_black,
+            steps=steps,
+            step_delay=step_delay,
+        )
 
     async def ping(self) -> dict[str, Any]:
         return await self._request("ping")

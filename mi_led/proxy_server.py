@@ -92,13 +92,27 @@ class BleProxyServer:
         if cmd == "enter_graffiti":
             await self._device.enter_graffiti_mode()
             return {"mode": "graffiti"}
+        if cmd == "sync_framebuffer":
+            pixels = msg.get("pixels")
+            if not isinstance(pixels, list) or len(pixels) != 256:
+                raise ValueError("pixels must be a list of 256 [r,g,b] triples")
+            picture = [tuple(int(c) for c in px) for px in pixels]
+            await self._device.sync_framebuffer(picture)
+            return {"synced": True}
         if cmd == "set_pixel":
+            canvas = msg.get("canvas")
+            canvas_tuples = None
+            if canvas is not None:
+                if not isinstance(canvas, list) or len(canvas) != 256:
+                    raise ValueError("canvas must be a list of 256 [r,g,b] triples")
+                canvas_tuples = [tuple(int(c) for c in px) for px in canvas]
             await self._device.set_pixel(
                 int(msg["x"]),
                 int(msg["y"]),
                 int(msg["r"]),
                 int(msg["g"]),
                 int(msg["b"]),
+                canvas=canvas_tuples,
             )
             return {"ok": True}
         if cmd == "send_frame":
@@ -108,6 +122,21 @@ class BleProxyServer:
             picture = [tuple(int(c) for c in px) for px in pixels]
             await self._device.send_frame(picture)
             return {"sent": True}
+        if cmd == "clear_screen":
+            await self._device.clear_screen()
+            return {"cleared": True}
+        if cmd == "fade_frame":
+            pixels = msg.get("pixels")
+            if not isinstance(pixels, list) or len(pixels) != 256:
+                raise ValueError("pixels must be a list of 256 [r,g,b] triples")
+            picture = [tuple(int(c) for c in px) for px in pixels]
+            await self._device.fade_frame(
+                picture,
+                to_black=bool(msg.get("to_black", True)),
+                steps=int(msg.get("steps", 8)),
+                step_delay=float(msg.get("step_delay", 0.04)),
+            )
+            return {"faded": True}
         raise ValueError(f"Unknown command: {cmd}")
 
     async def _client_handler(self, ws) -> None:

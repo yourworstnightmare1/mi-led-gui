@@ -34,9 +34,15 @@ def set_pixel_command(pixel_index_: int, r: int, g: int, b: int) -> bytearray:
     if not (0 <= pixel_index_ < PIXEL_COUNT):
         raise ValueError(f"Pixel index {pixel_index_} out of range")
 
-    end_index = (pixel_index_ + 1) % 256
+    # Captured manufacturer traffic uses QQ = PP+1, with wrap special-cases:
+    #   PP=0   → QQ=0xFF
+    #   PP=255 → QQ=0xFE
     if pixel_index_ == 0:
         end_index = 0xFF
+    elif pixel_index_ == 255:
+        end_index = 0xFE
+    else:
+        end_index = (pixel_index_ + 1) & 0xFF
 
     return bytearray(
         [
