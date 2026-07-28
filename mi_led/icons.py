@@ -35,6 +35,7 @@ OS_ICON_FILES = {
     "macos": "os_macos",
     "windows10": "os_windows10",
     "windows11": "os_windows11",
+    # Generic / version-unknown Windows peers (hostname inference, "Windows", etc.)
     "windows": "os_windows11",
     "linux": "os_linux",
     "unknown": "theme_system",
@@ -85,8 +86,10 @@ def load_icon(stem: str, size: tuple[int, int] = (20, 20)) -> Optional[ctk.CTkIm
     if not light_path.exists():
         return None
     try:
-        light = Image.open(light_path)
-        dark = Image.open(dark_path)
+        light = Image.open(light_path).convert("RGBA")
+        light.load()
+        dark = Image.open(dark_path).convert("RGBA")
+        dark.load()
         return ctk.CTkImage(light_image=light, dark_image=dark, size=size)
     except Exception:
         return None

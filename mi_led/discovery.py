@@ -18,23 +18,32 @@ DISCOVERY_VERSION = 2
 
 def detect_os_id() -> str:
     """Return a coarse OS id for discovery UI icons."""
-    system = platform.system()
-    if system == "Darwin":
+    system = (platform.system() or "").strip().lower()
+    if system in {"darwin", "macos"}:
         return "macos"
-    if system == "Windows":
+    if system.startswith("win"):
+        build = 0
         try:
             build = int(sys.getwindowsversion().build)  # type: ignore[attr-defined]
         except Exception:
-            build = 0
+            try:
+                # platform.version() often looks like "10.0.19045"
+                build = int((platform.version() or "").split(".")[-1])
+            except Exception:
+                build = 0
         return "windows11" if build >= 22000 else "windows10"
-    if system == "Linux":
+    if system == "linux":
         return "linux"
     return "unknown"
 
 
 def normalize_os_id(os_id: str | None) -> str:
     """Normalize announce / platform OS strings to icon keys."""
-    key = (os_id or "unknown").strip().lower().replace(" ", "").replace("-", "")
+    raw = (os_id or "").strip().lower()
+    if not raw or raw in {"unknown", "none", "null"}:
+        return "unknown"
+    # Keep digits; drop spaces/punctuation so "Windows 10", "windows_11", "Win-11" match.
+    key = "".join(ch for ch in raw if ch.isalnum())
     if not key:
         return "unknown"
     aliases = {
@@ -42,15 +51,15 @@ def normalize_os_id(os_id: str | None) -> str:
         "mac": "macos",
         "osx": "macos",
         "macos": "macos",
-        "win": "windows11",
-        "win32": "windows11",
-        "windows": "windows11",
+        "win": "windows",
+        "win32": "windows",
+        "win64": "windows",
+        "windows": "windows",
+        "windowsnt": "windows",
         "win10": "windows10",
         "windows10": "windows10",
-        "windows_10": "windows10",
         "win11": "windows11",
         "windows11": "windows11",
-        "windows_11": "windows11",
         "linux": "linux",
         "ubuntu": "linux",
         "debian": "linux",
@@ -60,7 +69,44 @@ def normalize_os_id(os_id: str | None) -> str:
     mapped = aliases.get(key, key)
     if mapped in {"macos", "windows10", "windows11", "windows", "linux", "unknown"}:
         return mapped
+    # e.g. "microsoftwindows10home" from a verbose platform string
+    if "windows11" in key or "win11" in key:
+        return "windows11"
+    if "windows10" in key or "win10" in key:
+        return "windows10"
+    if "windows" in key or key.startswith("win"):
+        return "windows"
+    if "mac" in key or "darwin" in key:
+        return "macos"
+    if "linux" in key:
+        return "linux"
     return "unknown"
+
+
+def infer_os_id_from_hostname(hostname: str | None) -> str:
+    """Best-effort OS guess for older peers that omit the announce `os` field."""
+    host = (hostname or "").strip().lower()
+    if not host:
+        return "unknown"
+    base = host.split(".")[0]
+    if base.startswith(("desktop-", "laptop-", "win-")) or base.startswith("windows"):
+        return "windows"
+    if any(
+        token in base
+        for token in ("macbook", "imac", "macmini", "mac-pro", "macpro")
+    ):
+        return "macos"
+    return "unknown"
+
+
+def resolve_os_id(*candidates: str | None, hostname: str | None = None) -> str:
+    """Pick the best OS id from announce fields, then hostname heuristics."""
+    for value in candidates:
+        normalized = normalize_os_id(value)
+        if normalized != "unknown":
+            return normalized
+    inferred = infer_os_id_from_hostname(hostname)
+    return inferred if inferred != "unknown" else "unknown"
 
 
 @dataclass(frozen=True)
@@ -145,7 +191,15 @@ def _parse_announce(data: bytes, from_ip: str, *, ping_ms: Optional[int] = None)
         port = 8765
     hostname = str(msg.get("hostname") or "").strip() or ip
     name = str(msg.get("name") or hostname).strip() or hostname
-    os_id = normalize_os_id(str(msg.get("os") or msg.get("os_id") or "unknown"))
+    # Case-insensitive field lookup — older/alternate clients may differ.
+    lowered = {str(k).lower(): v for k, v in msg.items()}
+    os_id = resolve_os_id(
+        lowered.get("os"),
+        lowered.get("os_id"),
+        lowered.get("platform"),
+        lowered.get("system"),
+        hostname=hostname,
+    )
     return SessionInfo(
         name=name,
         ip=ip,
@@ -212,6 +266,7 @@ class SessionBeacon:
             "bridge": bool(info.get("bridge")),
             "auth_required": bool(info.get("auth_required")),
             "os": str(info.get("os") or detect_os_id()),
+            "platform": platform.system() or "",
         }
         return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
