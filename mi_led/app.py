@@ -3450,13 +3450,18 @@ class MiLedApp(ctk.CTk):
             ).grid(row=0, column=col, sticky="ew", padx=6, pady=(4, 8))
 
         for row_i, session in enumerate(sessions, start=1):
-            icon = self._retain_icon(os_icon(session.os_id, size=(22, 22)))
-            os_cell = ctk.CTkFrame(table, fg_color="transparent")
+            icon = self._retain_icon(os_icon(session.os_id, size=(24, 24)))
+            os_cell = ctk.CTkFrame(table, fg_color="transparent", width=36, height=32)
             os_cell.grid(row=row_i, column=0, sticky="w", padx=6, pady=4)
+            os_cell.pack_propagate(False)
             if icon is not None:
-                ctk.CTkLabel(os_cell, text="", image=icon).pack(side="left")
+                ctk.CTkLabel(os_cell, text="", image=icon, width=28, height=28).place(
+                    relx=0.5, rely=0.5, anchor="center"
+                )
             else:
-                ctk.CTkLabel(os_cell, text=session.os_id or "?").pack(side="left")
+                ctk.CTkLabel(os_cell, text=(session.os_id or "?")[:3]).place(
+                    relx=0.5, rely=0.5, anchor="center"
+                )
 
             ctk.CTkLabel(table, text=session.hostname or session.name, anchor="w").grid(
                 row=row_i, column=1, sticky="ew", padx=6, pady=4

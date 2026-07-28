@@ -36,7 +36,7 @@ OS_ICON_FILES = {
     "windows10": "os_windows10",
     "windows11": "os_windows11",
     "windows": "os_windows11",
-    "linux": "theme_system",
+    "linux": "os_linux",
     "unknown": "theme_system",
 }
 
@@ -99,8 +99,11 @@ def nav_icon(key: str, size: tuple[int, int] = (18, 18)) -> Optional[ctk.CTkImag
     return load_icon(stem, size)
 
 
-def os_icon(os_id: str, size: tuple[int, int] = (22, 22)) -> Optional[ctk.CTkImage]:
-    stem = OS_ICON_FILES.get((os_id or "unknown").lower(), "theme_system")
+def os_icon(os_id: str, size: tuple[int, int] = (24, 24)) -> Optional[ctk.CTkImage]:
+    from .discovery import normalize_os_id
+
+    key = normalize_os_id(os_id)
+    stem = OS_ICON_FILES.get(key, "theme_system")
     return load_icon(stem, size)
 
 

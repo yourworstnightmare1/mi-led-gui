@@ -32,6 +32,37 @@ def detect_os_id() -> str:
     return "unknown"
 
 
+def normalize_os_id(os_id: str | None) -> str:
+    """Normalize announce / platform OS strings to icon keys."""
+    key = (os_id or "unknown").strip().lower().replace(" ", "").replace("-", "")
+    if not key:
+        return "unknown"
+    aliases = {
+        "darwin": "macos",
+        "mac": "macos",
+        "osx": "macos",
+        "macos": "macos",
+        "win": "windows11",
+        "win32": "windows11",
+        "windows": "windows11",
+        "win10": "windows10",
+        "windows10": "windows10",
+        "windows_10": "windows10",
+        "win11": "windows11",
+        "windows11": "windows11",
+        "windows_11": "windows11",
+        "linux": "linux",
+        "ubuntu": "linux",
+        "debian": "linux",
+        "fedora": "linux",
+        "arch": "linux",
+    }
+    mapped = aliases.get(key, key)
+    if mapped in {"macos", "windows10", "windows11", "windows", "linux", "unknown"}:
+        return mapped
+    return "unknown"
+
+
 @dataclass(frozen=True)
 class SessionInfo:
     name: str
@@ -114,7 +145,7 @@ def _parse_announce(data: bytes, from_ip: str, *, ping_ms: Optional[int] = None)
         port = 8765
     hostname = str(msg.get("hostname") or "").strip() or ip
     name = str(msg.get("name") or hostname).strip() or hostname
-    os_id = str(msg.get("os") or msg.get("os_id") or "unknown").strip().lower() or "unknown"
+    os_id = normalize_os_id(str(msg.get("os") or msg.get("os_id") or "unknown"))
     return SessionInfo(
         name=name,
         ip=ip,
