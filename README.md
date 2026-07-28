@@ -1,9 +1,12 @@
 # Merkury Innovations Matrix LED Display SDK
 
-Python toolkit and desktop GUI for the Merkury Innovations Multicolor Matrix LED Display (MI-LNL62-999W), based on reverse engineering of its BLE protocol. The display is sold at [Walmart](https://www.walmart.com/ip/Merkury-Innovations-Bluetooth-Matrix-LED-Pixel-Display/5150283693).
+This is a desktop GUI for the Merkury Innovations Multicolor Matrix LED Display (MI-LNL62-999W), based on reverse engineering of its BLE protocol. The display is sold at [Walmart](https://www.walmart.com/ip/Merkury-Innovations-Bluetooth-Matrix-LED-Pixel-Display/5150283693).
+
+# Support the original creator
+The tools that helped create this program and all BLE reverse engineering was done by [offe](https://github.com/offe/), I just provide a GUI version of what they built with additional features. Please support them as without their work this program wouldn't be possible!
 
 # What this app can do
-- Allows remote control of your Matrix LED Display straight from your Windows or macOS device with ease
+- Allows remote control of your Matrix LED Display straight from your Windows, macOS, or Linux device with ease
 - Create drawings and display them on the LED display
 - Create animations with unlimited frames and display them on the LED display
 - Create text with custom backgrounds and animations and display them on the LED display
@@ -21,6 +24,7 @@ Python toolkit and desktop GUI for the Merkury Innovations Multicolor Matrix LED
 - Support for animations of 10ms per frame update (display hardware limitation)
 - Support for launching app on device startup
 - Support for auto minimizing app on device startup if launched on startup
+- and more!
 
 *On macOS, you must download [BlackHole](https://existential.audio/blackhole/) in order to use system sound as it is not natively supported.
 
