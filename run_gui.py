@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the MI LED Display desktop GUI."""
+"""Launch the MI LED Display desktop GUI (or BLE bridge with --bridge)."""
 
 from __future__ import annotations
 
@@ -30,8 +30,19 @@ def _check_runtime() -> None:
         ) from exc
 
 
-if __name__ == "__main__":
-    _check_runtime()
-    from mi_led.app import main
+def _run_bridge(argv: list[str]) -> None:
+    from mi_led.proxy_server import main as proxy_main
 
-    main()
+    proxy_main(argv)
+
+
+if __name__ == "__main__":
+    if "--bridge" in sys.argv:
+        # Frozen/startup entry: MI LED.exe --bridge --host ... --port ...
+        bridge_argv = [a for a in sys.argv[1:] if a != "--bridge"]
+        _run_bridge(bridge_argv)
+    else:
+        _check_runtime()
+        from mi_led.app import main
+
+        main()

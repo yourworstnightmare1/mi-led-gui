@@ -49,7 +49,9 @@ from .protocol import MATRIX_SIZE
 from .proxy_protocol import DEFAULT_PROXY_PORT
 from .proxy_server import BleProxyServer
 from .settings import (
+    apply_bridge_start_on_boot,
     apply_start_on_boot,
+    bridge_start_on_boot_installed,
     load_settings,
     load_workspace,
     save_settings,
@@ -1002,7 +1004,7 @@ class MiLedApp(ctk.CTk):
         body = ctk.CTkFrame(page)
         body.grid(row=2, column=0, sticky="nsew", padx=4, pady=4)
         body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(5, weight=1)
+        body.grid_rowconfigure(6, weight=1)
 
         ctk.CTkLabel(body, text="Bind host").grid(row=0, column=0, padx=12, pady=8, sticky="w")
         host_row = ctk.CTkFrame(body, fg_color="transparent")
@@ -1027,7 +1029,7 @@ class MiLedApp(ctk.CTk):
         )
 
         btns = ctk.CTkFrame(body, fg_color="transparent")
-        btns.grid(row=3, column=0, columnspan=2, sticky="w", padx=12, pady=8)
+        btns.grid(row=3, column=0, columnspan=2, sticky="w", padx=12, pady=(8, 2))
         self._bridge_start_btn = self._icon_btn(
             btns, text="Start Bridge", command=self._bridge_start, icon="play", width=140
         )
@@ -1041,9 +1043,27 @@ class MiLedApp(ctk.CTk):
             state="disabled",
         )
         self._bridge_stop_btn.pack(side="left", padx=4)
+        self._bridge_startup_btn = self._icon_btn(
+            btns,
+            text="Add to Startup Services",
+            command=self._toggle_bridge_startup,
+            icon="power",
+            width=200,
+        )
+        self._bridge_startup_btn.pack(side="left", padx=(12, 0))
+        self._refresh_bridge_startup_btn()
+
+        ctk.CTkLabel(
+            body,
+            text="Startup Services launches the BLE bridge at login (macOS LaunchAgent, "
+            "Windows Startup, or Linux XDG autostart) using the bind host / port / token above.",
+            text_color=("gray35", "gray65"),
+            wraplength=700,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 6))
 
         client = ctk.CTkFrame(body)
-        client.grid(row=4, column=0, columnspan=2, sticky="ew", padx=12, pady=8)
+        client.grid(row=5, column=0, columnspan=2, sticky="ew", padx=12, pady=8)
         ctk.CTkLabel(client, text="GUI client connection", font=ctk.CTkFont(weight="bold")).pack(
             anchor="w", padx=10, pady=(8, 4)
         )
@@ -1090,7 +1110,7 @@ class MiLedApp(ctk.CTk):
         self._update_proxy_fields()
 
         self._bridge_log = ctk.CTkTextbox(body, height=180)
-        self._bridge_log.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=12, pady=12)
+        self._bridge_log.grid(row=6, column=0, columnspan=2, sticky="nsew", padx=12, pady=12)
         self._bridge_log.insert("end", "Bridge log…\n")
         self._bridge_log.configure(state="disabled")
         return page
@@ -3534,6 +3554,57 @@ class MiLedApp(ctk.CTk):
             save_settings(self.settings)
         except Exception:
             pass
+
+    def _refresh_bridge_startup_btn(self) -> None:
+        btn = getattr(self, "_bridge_startup_btn", None)
+        if btn is None:
+            return
+        enabled = bool(self.settings.bridge_start_on_boot) or bridge_start_on_boot_installed()
+        self.settings.bridge_start_on_boot = enabled
+        if enabled:
+            btn.configure(text="Remove from Startup Services", width=230)
+        else:
+            btn.configure(text="Add to Startup Services", width=200)
+
+    def _toggle_bridge_startup(self) -> None:
+        currently = bool(self.settings.bridge_start_on_boot) or bridge_start_on_boot_installed()
+        enable = not currently
+        host = self.bridge_host.get().strip() or "0.0.0.0"
+        token = self.bridge_token.get().strip()
+        try:
+            port = int(self.bridge_port.get().strip() or DEFAULT_PROXY_PORT)
+        except ValueError:
+            messagebox.showerror("BLE Bridge", "Port must be a number.")
+            return
+
+        ok, msg = apply_bridge_start_on_boot(
+            enable, host=host, port=port, token=token
+        )
+        if not ok:
+            messagebox.showerror("Startup Services", msg)
+            self._bridge_append(msg)
+            return
+
+        self.settings.bridge_start_on_boot = enable
+        self.settings.bridge_bind_host = host
+        self.settings.bridge_port = port
+        self.settings.bridge_token = token
+        try:
+            save_settings(self.settings)
+        except Exception as exc:
+            self._bridge_append(f"Saved startup entry, but settings write failed: {exc}")
+
+        self._refresh_bridge_startup_btn()
+        self._bridge_append(msg)
+        self._set_status(msg)
+        if enable:
+            messagebox.showinfo(
+                "Startup Services",
+                f"{msg}\n\n"
+                "The BLE bridge will start when you log in.\n"
+                "While it is running, use Mode → BLE Proxy (this PC's IP or 127.0.0.1) "
+                "instead of Local BLE on this machine.",
+            )
 
     def _bridge_start(self) -> None:
         if self._bridge_running:
