@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shlex
 import sys
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -46,6 +47,8 @@ class AppSettings:
     preview_yellow_push: float = 0.12
     preview_bloom: float = 0.0
     hide_connection_notice: bool = False
+    # Appearance: "System" (default) | "Light" | "Dark"
+    appearance_mode: str = "System"
 
     def clamp(self) -> "AppSettings":
         # Below ~10 ms the panel shows pixel shifts / laggy full-frame updates.
@@ -57,6 +60,10 @@ class AppSettings:
         self.fade_step_ms = max(10, min(int(self.fade_step_ms), 500))
         if self.connection_mode not in ("local", "proxy"):
             self.connection_mode = "local"
+        mode = str(self.appearance_mode or "System").strip().title()
+        if mode not in ("System", "Light", "Dark"):
+            mode = "System"
+        self.appearance_mode = mode
         self.preview_gamma = max(0.3, min(float(self.preview_gamma), 1.5))
         self.preview_brightness = max(0.5, min(float(self.preview_brightness), 2.0))
         self.preview_saturation = max(0.5, min(float(self.preview_saturation), 2.0))
@@ -72,7 +79,10 @@ def settings_dir() -> Path:
     elif system == "Windows":
         base = Path(os.environ.get("APPDATA", Path.home())) / APP_DIR_NAME
     else:
-        base = Path.home() / ".config" / APP_DIR_NAME
+        # Linux / other Unix — XDG config home.
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        base = Path(xdg) if xdg else (Path.home() / ".config")
+        base = base / APP_DIR_NAME
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -196,6 +206,8 @@ def save_workspace(
 
 
 def _python_launch_command() -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
     root = Path(__file__).resolve().parent.parent
     run_gui = root / "run_gui.py"
     return [sys.executable, str(run_gui)]
@@ -208,7 +220,9 @@ def apply_start_on_boot(enabled: bool) -> tuple[bool, str]:
         return _apply_macos_login_item(enabled)
     if system == "Windows":
         return _apply_windows_startup(enabled)
-    return False, "Start on boot is only supported on macOS and Windows"
+    if system == "Linux":
+        return _apply_linux_autostart(enabled)
+    return False, f"Start on boot is not supported on {system or 'this OS'}"
 
 
 def _apply_macos_login_item(enabled: bool) -> tuple[bool, str]:
@@ -269,3 +283,43 @@ def _apply_windows_startup(enabled: bool) -> tuple[bool, str]:
             return True, "Removed Windows startup entry"
     except OSError as exc:
         return False, f"Could not update startup registry: {exc}"
+
+
+def _linux_autostart_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else (Path.home() / ".config")
+    return base / "autostart" / f"{APP_DIR_NAME}.desktop"
+
+
+def _apply_linux_autostart(enabled: bool) -> tuple[bool, str]:
+    desktop_path = _linux_autostart_path()
+    if not enabled:
+        if desktop_path.exists():
+            try:
+                desktop_path.unlink()
+            except OSError as exc:
+                return False, f"Could not remove autostart entry: {exc}"
+        return True, "Removed Linux autostart entry"
+
+    cmd = _python_launch_command()
+    exec_line = " ".join(shlex.quote(part) for part in cmd)
+    workdir = str(Path(__file__).resolve().parent.parent)
+    body = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Version=1.0\n"
+        "Name=MI LED\n"
+        "Comment=Merkury Matrix LED Display controller\n"
+        f"Exec={exec_line}\n"
+        f"Path={workdir}\n"
+        "Terminal=false\n"
+        "Categories=Utility;\n"
+        "X-GNOME-Autostart-enabled=true\n"
+    )
+    try:
+        desktop_path.parent.mkdir(parents=True, exist_ok=True)
+        desktop_path.write_text(body, encoding="utf-8")
+        desktop_path.chmod(desktop_path.stat().st_mode | 0o111)
+    except OSError as exc:
+        return False, f"Could not write autostart entry: {exc}"
+    return True, f"Installed Linux autostart at {desktop_path}"

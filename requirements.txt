@@ -5,3 +5,4 @@ websockets>=12.0
 psutil>=5.9.0
 numpy>=1.24.0
 sounddevice>=0.4.6
+certifi>=2024.0.0

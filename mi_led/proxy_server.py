@@ -11,7 +11,7 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 from .device import MiLedDevice
-from .discovery import SessionBeacon, preferred_lan_ip
+from .discovery import SessionBeacon, detect_os_id, preferred_lan_ip
 from .proxy_protocol import DEFAULT_PROXY_HOST, DEFAULT_PROXY_PORT, PROTOCOL_VERSION, dumps, loads
 
 
@@ -52,6 +52,7 @@ class BleProxyServer:
             "port": self.port,
             "bridge": True,
             "auth_required": bool(self.token),
+            "os": detect_os_id(),
         }
 
     def _on_device_status(self, message: str) -> None:

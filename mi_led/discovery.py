@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import platform
 import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -11,7 +13,23 @@ from typing import Any, Callable, Optional
 
 DISCOVERY_PORT = 8766
 DISCOVERY_MAGIC = "mi-led"
-DISCOVERY_VERSION = 1
+DISCOVERY_VERSION = 2
+
+
+def detect_os_id() -> str:
+    """Return a coarse OS id for discovery UI icons."""
+    system = platform.system()
+    if system == "Darwin":
+        return "macos"
+    if system == "Windows":
+        try:
+            build = int(sys.getwindowsversion().build)  # type: ignore[attr-defined]
+        except Exception:
+            build = 0
+        return "windows11" if build >= 22000 else "windows10"
+    if system == "Linux":
+        return "linux"
+    return "unknown"
 
 
 @dataclass(frozen=True)
@@ -22,12 +40,18 @@ class SessionInfo:
     bridge: bool
     auth_required: bool
     hostname: str
+    os_id: str = "unknown"
+    ping_ms: Optional[int] = None
 
     @property
     def label(self) -> str:
         role = "bridge" if self.bridge else "app"
         auth = " · auth" if self.auth_required else ""
         return f"{self.name}  —  {self.ip}:{self.port}  ({role}{auth})"
+
+    @property
+    def endpoint(self) -> str:
+        return f"{self.ip}:{self.port}"
 
 
 def preferred_lan_ip() -> Optional[str]:
@@ -72,7 +96,7 @@ def _subnet_broadcasts(ips: list[str]) -> list[str]:
     return out
 
 
-def _parse_announce(data: bytes, from_ip: str) -> Optional[SessionInfo]:
+def _parse_announce(data: bytes, from_ip: str, *, ping_ms: Optional[int] = None) -> Optional[SessionInfo]:
     try:
         msg = json.loads(data.decode("utf-8"))
     except Exception:
@@ -90,6 +114,7 @@ def _parse_announce(data: bytes, from_ip: str) -> Optional[SessionInfo]:
         port = 8765
     hostname = str(msg.get("hostname") or "").strip() or ip
     name = str(msg.get("name") or hostname).strip() or hostname
+    os_id = str(msg.get("os") or msg.get("os_id") or "unknown").strip().lower() or "unknown"
     return SessionInfo(
         name=name,
         ip=ip,
@@ -97,6 +122,8 @@ def _parse_announce(data: bytes, from_ip: str) -> Optional[SessionInfo]:
         bridge=bool(msg.get("bridge")),
         auth_required=bool(msg.get("auth_required")),
         hostname=hostname,
+        os_id=os_id,
+        ping_ms=ping_ms,
     )
 
 
@@ -125,7 +152,6 @@ class SessionBeacon:
         sock = self._sock
         if sock is not None:
             try:
-                # Unblock recvfrom on platforms that ignore timeout after close.
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as poke:
                     poke.sendto(b"{}", ("127.0.0.1", DISCOVERY_PORT))
             except Exception:
@@ -154,6 +180,7 @@ class SessionBeacon:
             "port": int(info.get("port") or 8765),
             "bridge": bool(info.get("bridge")),
             "auth_required": bool(info.get("auth_required")),
+            "os": str(info.get("os") or detect_os_id()),
         }
         return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
@@ -202,7 +229,12 @@ class SessionBeacon:
                 self._sock = None
 
 
-def scan_sessions(timeout: float = 1.8) -> list[SessionInfo]:
+def scan_sessions(
+    timeout: float = 1.8,
+    *,
+    bridges_only: bool = False,
+    exclude_ips: Optional[set[str]] = None,
+) -> list[SessionInfo]:
     """Broadcast a discovery query and collect announce replies."""
     query = json.dumps(
         {"magic": DISCOVERY_MAGIC, "type": "discover", "v": DISCOVERY_VERSION},
@@ -219,6 +251,7 @@ def scan_sessions(timeout: float = 1.8) -> list[SessionInfo]:
     for bcast in _subnet_broadcasts(local_ipv4_addresses()):
         targets.append((bcast, DISCOVERY_PORT))
 
+    sent_at = time.monotonic()
     for target in targets:
         try:
             sock.sendto(query, target)
@@ -226,6 +259,7 @@ def scan_sessions(timeout: float = 1.8) -> list[SessionInfo]:
             continue
 
     found: dict[tuple[str, int], SessionInfo] = {}
+    exclude = exclude_ips or set()
     deadline = time.monotonic() + max(0.4, float(timeout))
     try:
         while time.monotonic() < deadline:
@@ -235,13 +269,24 @@ def scan_sessions(timeout: float = 1.8) -> list[SessionInfo]:
                 continue
             except OSError:
                 break
-            session = _parse_announce(data, addr[0])
+            ping_ms = max(0, int(round((time.monotonic() - sent_at) * 1000)))
+            session = _parse_announce(data, addr[0], ping_ms=ping_ms)
             if session is None:
                 continue
-            found[(session.ip, session.port)] = session
+            if session.ip in exclude:
+                continue
+            if bridges_only and not session.bridge:
+                continue
+            key = (session.ip, session.port)
+            prev = found.get(key)
+            if prev is None or (
+                session.ping_ms is not None
+                and (prev.ping_ms is None or session.ping_ms < prev.ping_ms)
+            ):
+                found[key] = session
     finally:
         sock.close()
 
     sessions = list(found.values())
-    sessions.sort(key=lambda s: (not s.bridge, s.name.lower(), s.ip))
+    sessions.sort(key=lambda s: (s.hostname.lower(), s.ip, s.port))
     return sessions

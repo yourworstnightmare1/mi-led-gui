@@ -61,6 +61,12 @@ def _looks_like_loopback(name: str) -> bool:
         "what u hear",
         "wave out mix",
         "multi-output",
+        # Linux PulseAudio / PipeWire monitor sinks
+        "monitor of",
+        ".monitor",
+        "pulse",
+        "pipewire",
+        "alsa_output",
     )
     return any(k in lower for k in keys)
 
@@ -72,7 +78,8 @@ class AudioCapture:
     Sources:
       - microphone: default (or chosen) input device
       - system: Windows WASAPI loopback when possible; otherwise a virtual
-        loopback device (BlackHole / VB-Cable / Stereo Mix) if present
+        loopback / monitor device (BlackHole, VB-Cable, Pulse/PipeWire
+        monitor, Stereo Mix) if present
     """
 
     def __init__(self) -> None:
@@ -118,13 +125,24 @@ class AudioCapture:
                 "macOS system audio needs a virtual device such as BlackHole "
                 "(or similar). Without one, use Microphone."
             )
+        if system == "Linux":
+            return (
+                "Linux system audio needs a PulseAudio/PipeWire monitor input "
+                "(often named “Monitor of …”). Enable one in pavucontrol, or use Microphone."
+            )
         return (
             "System audio needs a monitor/loopback input device on this OS. "
             "Otherwise use Microphone."
         )
 
     def resolve_system_device(self) -> Optional[int]:
-        for index, name in list_input_devices():
+        devices = list_input_devices()
+        # Prefer explicit monitor / loopback names.
+        for index, name in devices:
+            lower = name.lower()
+            if "monitor of" in lower or lower.endswith(".monitor") or "loopback" in lower:
+                return index
+        for index, name in devices:
             if _looks_like_loopback(name):
                 return index
         return None
