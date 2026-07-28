@@ -36,10 +36,13 @@ class MiLedDevice:
         on_status: Optional[StatusCallback] = None,
         on_debug: Optional[DebugCallback] = None,
         on_connection_lost: Optional[ConnectionLostCallback] = None,
+        *,
+        preferred_address: Optional[str] = None,
     ):
         self._client: Optional[BleakClient] = None
         self._address: Optional[str] = None
         self._name: Optional[str] = None
+        self._preferred_address = (preferred_address or "").strip() or None
         self._graffiti_ready = False
         self._framebuffer: list[tuple[int, int, int]] = [(0, 0, 0)] * proto.PIXEL_COUNT
         self._on_status = on_status or (lambda _msg: None)
@@ -59,6 +62,13 @@ class MiLedDevice:
         if self._address:
             return f"{name} ({self._address})"
         return name
+
+    @property
+    def address(self) -> Optional[str]:
+        return self._address
+
+    def set_preferred_address(self, address: Optional[str]) -> None:
+        self._preferred_address = (address or "").strip() or None
 
     def _status(self, message: str) -> None:
         self._on_status(message)
@@ -84,19 +94,85 @@ class MiLedDevice:
         self._debug("GATT disconnected unexpectedly")
         self._notify_connection_lost()
 
-    async def find_device(self, scan_timeout: float = 10.0):
+    @staticmethod
+    def _adv_name(device, adv=None) -> str:
+        name = (getattr(device, "name", None) or "").strip()
+        if name:
+            return name
+        if adv is not None:
+            return (getattr(adv, "local_name", None) or "").strip()
+        return ""
+
+    @staticmethod
+    def _adv_has_service(adv) -> bool:
+        if adv is None:
+            return False
+        target = proto.SERVICE_UUID.lower()
+        for uuid in getattr(adv, "service_uuids", None) or []:
+            if str(uuid).lower() == target:
+                return True
+        return False
+
+    async def find_device(self, scan_timeout: float = 12.0):
+        preferred = self._preferred_address
+        if preferred:
+            self._status(f"Trying last known display ({preferred})…")
+            self._debug(f"BLE preferred address probe: {preferred}")
+            try:
+                device = await BleakScanner.find_device_by_address(
+                    preferred, timeout=min(5.0, scan_timeout)
+                )
+                if device is not None:
+                    self._status(f"Found last known display: {self._adv_name(device) or preferred}")
+                    return device
+            except Exception as exc:
+                self._debug(f"Preferred address lookup failed: {exc}")
+
         self._status("Scanning for BLE devices...")
         self._debug(f"BLE scan start (timeout={scan_timeout}s)")
-        devices = await BleakScanner.discover(timeout=scan_timeout)
-        self._debug(f"BLE scan found {len(devices)} device(s)")
+        try:
+            discovered = await BleakScanner.discover(
+                timeout=scan_timeout, return_adv=True
+            )
+        except TypeError:
+            # Older Bleak without return_adv=
+            plain = await BleakScanner.discover(timeout=scan_timeout)
+            discovered = {d.address: (d, None) for d in plain}
 
-        for d in devices:
-            if d.name and proto.DEVICE_NAME_HINT in d.name:
-                self._status(f"Found by name: {d.name} [{d.address}]")
-                return d
+        self._debug(f"BLE scan found {len(discovered)} device(s)")
+        named: list = []
+        service_hits: list = []
+        for _addr, pair in discovered.items():
+            if isinstance(pair, tuple):
+                device, adv = pair
+            else:
+                device, adv = pair, None
+            label = self._adv_name(device, adv)
+            if label:
+                self._debug(f"  seen: {label!r} [{device.address}]")
+            if label and proto.DEVICE_NAME_HINT in label:
+                named.append(device)
+            elif self._adv_has_service(adv):
+                service_hits.append(device)
+
+        if named:
+            device = named[0]
+            self._status(f"Found by name: {self._adv_name(device)} [{device.address}]")
+            return device
+        if service_hits:
+            device = service_hits[0]
+            self._status(f"Found by advertised service UUID: {device.address}")
+            return device
 
         self._status("Name not found; probing services...")
-        for d in devices:
+        # Prefer devices that at least advertised a name — skip phones/headphones noise last.
+        ordered = []
+        for _addr, pair in discovered.items():
+            device, adv = pair if isinstance(pair, tuple) else (pair, None)
+            ordered.append((1 if self._adv_name(device, adv) else 0, device))
+        ordered.sort(key=lambda item: item[0], reverse=True)
+
+        for _rank, d in ordered:
             self._status(f"Checking: {d.name or 'Unknown'} [{d.address}]")
             try:
                 async with BleakClient(d, timeout=5.0) as client:
@@ -119,14 +195,17 @@ class MiLedDevice:
 
         return None
 
-    async def connect(self, scan_timeout: float = 10.0) -> bool:
+    async def connect(self, scan_timeout: float = 12.0) -> bool:
         if self.is_connected:
             self._status(f"Already connected to {self.device_label}")
             return True
 
         target = await self.find_device(scan_timeout=scan_timeout)
         if target is None:
-            self._status("MI Matrix Display not found")
+            self._status(
+                "MI Matrix Display not found — power-cycle the panel, close the "
+                "official Merkury/LED apps on your phone, then try Connect again"
+            )
             return False
 
         self._status(f"Connecting to {target.name or 'device'} ({target.address})...")
@@ -138,7 +217,8 @@ class MiLedDevice:
 
         self._client = client
         self._address = target.address
-        self._name = target.name
+        self._preferred_address = target.address
+        self._name = target.name or self._adv_name(target) or "MI Matrix Display"
         self._graffiti_ready = False
         self._framebuffer = [(0, 0, 0)] * proto.PIXEL_COUNT
         self._status(f"Connected to {self.device_label}")
@@ -348,6 +428,7 @@ class DeviceController:
         mode: str = "local",
         proxy_url: str = DEFAULT_PROXY_URL,
         proxy_token: Optional[str] = None,
+        preferred_address: Optional[str] = None,
     ):
         self._on_status = on_status or (lambda _msg: None)
         self._on_debug = on_debug or (lambda _msg: None)
@@ -355,6 +436,7 @@ class DeviceController:
         self._mode = mode
         self._proxy_url = proxy_url
         self._proxy_token = proxy_token
+        self._preferred_address = (preferred_address or "").strip() or None
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, name="mi-led-ble", daemon=True)
         self._device: Backend = self._make_backend()
@@ -373,6 +455,7 @@ class DeviceController:
             on_status=self._forward_status,
             on_debug=self._forward_debug,
             on_connection_lost=self._forward_connection_lost,
+            preferred_address=self._preferred_address,
         )
 
     def configure(
@@ -381,12 +464,15 @@ class DeviceController:
         mode: str,
         proxy_url: str = DEFAULT_PROXY_URL,
         proxy_token: Optional[str] = None,
+        preferred_address: Optional[str] = None,
     ) -> None:
         """Switch local/proxy backend. Disconnects the previous backend."""
         old = self._device
         self._mode = mode
         self._proxy_url = proxy_url
         self._proxy_token = proxy_token
+        if preferred_address is not None:
+            self._preferred_address = (preferred_address or "").strip() or None
         self._device = self._make_backend()
         try:
             self.submit(old.disconnect())
@@ -397,6 +483,16 @@ class DeviceController:
     def mode(self) -> str:
         return self._mode
 
+    @property
+    def ble_address(self) -> Optional[str]:
+        addr = getattr(self._device, "address", None)
+        return addr or self._preferred_address
+
+    def set_preferred_address(self, address: Optional[str]) -> None:
+        self._preferred_address = (address or "").strip() or None
+        setter = getattr(self._device, "set_preferred_address", None)
+        if callable(setter):
+            setter(self._preferred_address)
     def _forward_status(self, message: str) -> None:
         self._on_status(message)
 

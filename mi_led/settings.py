@@ -41,6 +41,7 @@ class AppSettings:
     bridge_port: int = 8765
     bridge_token: str = ""
     connection_mode: str = "local"  # "local" | "proxy"
+    ble_last_address: str = ""
     fade_steps: int = 8
     fade_step_ms: int = 40
     # LED-accurate on-screen preview (does not change values sent to the panel).

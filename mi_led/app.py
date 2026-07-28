@@ -229,6 +229,7 @@ class MiLedApp(ctk.CTk):
             on_status=self._queue_status,
             on_debug=self._queue_debug,
             on_connection_lost=self._queue_connection_lost,
+            preferred_address=getattr(self.settings, "ble_last_address", "") or None,
         )
 
         self._preview_style = self._make_preview_style()
@@ -1888,10 +1889,28 @@ class MiLedApp(ctk.CTk):
 
     def _apply_transport(self) -> None:
         token = self.proxy_token.get().strip() or None
+        preferred = getattr(self.settings, "ble_last_address", "") or None
         if self._is_proxy_mode():
-            self.device.configure(mode="proxy", proxy_url=self._proxy_url(), proxy_token=token)
+            self.device.configure(
+                mode="proxy",
+                proxy_url=self._proxy_url(),
+                proxy_token=token,
+                preferred_address=preferred,
+            )
         else:
-            self.device.configure(mode="local")
+            self.device.configure(mode="local", preferred_address=preferred)
+
+    def _remember_ble_address(self) -> None:
+        addr = self.device.ble_address
+        if not addr or self._is_proxy_mode():
+            return
+        if getattr(self.settings, "ble_last_address", "") == addr:
+            return
+        self.settings.ble_last_address = addr
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
 
     def _auto_connect(self) -> None:
         # Prefer local Bluetooth on this machine. Proxy mode is only for driving
@@ -1936,6 +1955,7 @@ class MiLedApp(ctk.CTk):
             self._set_busy(False)
             if ok:
                 self._set_status(f"Connected to {self.device.device_label}")
+                self._remember_ble_address()
                 # Don't enter graffiti here — init clears the panel. Live draws
                 # enter graffiti on demand and restore the canvas afterward.
                 self.after(50, self._restore_display_after_connect)
